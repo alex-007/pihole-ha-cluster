@@ -173,9 +173,11 @@ if [[ "${1:-}" == "--handle" ]]; then
     }
 
     read -r method path _rest
+    _LEASE_SID=""
     path="${path%$'\r'}"
     while IFS= read -r hdr; do
         hdr="${hdr%$'\r'}"
+        [[ "${hdr,,}" == sid:* ]] && _LEASE_SID="${hdr#*: }"
         [[ -z "$hdr" ]] && break
     done
 
@@ -376,6 +378,63 @@ if [[ "${1:-}" == "--handle" ]]; then
                 _AUTH_CHECKED="1"
             fi
             printf '{"auth_required":%s}\n' "$_AUTH_REQUIRED"
+            ;;
+        /api/leases/yield)
+            for _p in /usr/local/bin/pihole-ha-lease-sync ./pihole-ha-lease-sync; do
+                [[ -f "$_p" ]] && { . "$_p"; break; }
+            done
+            if ! declare -F lease_sync_load >/dev/null; then
+                send_headers "404 Not Found" "text/plain"
+            else
+                lease_sync_load
+                _target=""
+                IFS='&' read -ra _parts <<< "${path#*\?}"
+                for _part in "${_parts[@]}"; do [[ "$_part" == target=* ]] && _target="${_part#target=}"; done
+                if [[ "$LEASE_SYNC_ENABLED" != true ]]; then
+                    send_headers "404 Not Found" "text/plain"
+                elif ! _check_auth "sid=$_LEASE_SID"; then
+                    _send_401
+                elif [[ "$method" != POST ]] || ! is_valid_ip "$_target" || ! _is_known_node "$_target" || [[ "$_target" == "$_LOCAL_IP" ]]; then
+                    send_headers "400 Bad Request" "text/plain"
+                else
+                    _hold=30
+                    _interval="${CHECK_INTERVAL:-10}"
+                    if [[ "$_interval" =~ ^[0-9]{1,4}$ ]]; then
+                        _hold=$(( 3 * 10#$_interval ))
+                        (( _hold < 30 )) && _hold=30
+                        (( _hold > 300 )) && _hold=300
+                    fi
+                    mkdir -p "$LEASE_SYNC_DIR" && chmod 0700 "$LEASE_SYNC_DIR"
+                    _yield_tmp="$(mktemp "$LEASE_SYNC_DIR/.yield.XXXXXX")"
+                    if [[ -n "$_yield_tmp" ]] && printf '%s %s\n' "$_target" "$(( $(date +%s) + _hold ))" > "$_yield_tmp" && mv -f "$_yield_tmp" "$LEASE_SYNC_DIR/yield"; then
+                        send_headers "202 Accepted" "application/json"
+                        printf '{"accepted":true}\n'
+                    else
+                        [[ -n "$_yield_tmp" ]] && rm -f "$_yield_tmp"
+                        send_headers "500 Internal Server Error" "text/plain"
+                    fi
+                fi
+            fi
+            ;;
+        /api/leases/snapshot)
+            for _p in /usr/local/bin/pihole-ha-lease-sync ./pihole-ha-lease-sync; do
+                [[ -f "$_p" ]] && { . "$_p"; break; }
+            done
+            if ! declare -F lease_sync_load >/dev/null; then
+                send_headers "404 Not Found" "text/plain"
+            else
+                lease_sync_load
+                if [[ "$LEASE_SYNC_ENABLED" != true || ! -f "$LEASE_SYNC_DIR/cache" ]]; then
+                    send_headers "404 Not Found" "text/plain"
+                elif ! _check_auth "sid=$_LEASE_SID"; then
+                    _send_401
+                else
+                    # Published only while active. Keep the final signed snapshot
+                    # available after stand-down for the handover recipient.
+                    send_headers "200 OK" "application/octet-stream"
+                    cat "$LEASE_SYNC_DIR/cache"
+                fi
+            fi
             ;;
         /api/sync/manifest)
             if [[ -f "$SYNC_MANIFEST" ]]; then

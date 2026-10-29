@@ -157,6 +157,8 @@ build_daemon() {
         "$REPO/pihole-ha" > "$W/pihole-ha"
     sed -e "s#/etc/pihole-ha#$W/etc/pihole-ha#g" \
         "$REPO/pihole-ha-platform" > "$W/pihole-ha-platform"
+    sed -e "s#/etc/pihole-ha#$W/etc/pihole-ha#g" \
+        "$REPO/pihole-ha-lease-sync" > "$W/pihole-ha-lease-sync"
     # A rewrite that silently misses the loop would run one cycle and pass
     # everything for the wrong reason.
     grep -q '_test_cycle' "$W/pihole-ha" || { echo "harness: loop rewrite failed" >&2; exit 1; }
