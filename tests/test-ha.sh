@@ -719,6 +719,15 @@ assert_contains     "bare-metal still uses systemctl restart" "$_ftl_restart_fn"
 # silently lost its daemon is not recorded as a success.
 assert_contains "docker reload verifies FTL is still alive" "$_docker_branch" "kill -0"
 
+# Moving the DNS VIP invalidates dnsmasq's local-interface suppression cache.
+# A full native FTL restart is required after the address is actually removed;
+# SIGHUP is not sufficient.
+_remove_vip_fn="$(extract_fn "$SCRIPT_DIR/../pihole-ha" remove_vip)"
+assert_contains "VIP removal refreshes FTL after address withdrawal" "$_remove_vip_fn" "platform_ftl_restart_dns"
+assert_contains "VIP refresh happens after ip address deletion" "$_remove_vip_fn" 'ip addr del "$VIP/32" dev "$IFACE"'
+assert_contains "Docker DNS refresh uses native restartdns action" \
+    "$(cat "$_plat")" "action/restartdns"
+
 # ============================================================
 echo
 echo "=== Docker provisioning: peer auth + DNS pin ==="
