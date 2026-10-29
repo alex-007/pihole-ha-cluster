@@ -655,6 +655,7 @@ remove_vip() {
         log_error "event=vip_remove status=failed iface=$IFACE error=\"$err\""
         return 1
     }
+    platform_ftl_restart_dns || log_warn "event=dns_refresh status=failed reason=\"could not fully reinitialize FTL after VIP withdrawal\""
     log_info "event=vip_remove ip=$VIP iface=$IFACE status=ok"
 }
 
