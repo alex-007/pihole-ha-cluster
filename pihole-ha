@@ -1786,6 +1786,7 @@ while true; do
         fi
         if [[ "$current" == "false" ]]; then
             deactivate_count=0
+            has_vip && remove_vip
             write_status ""
             continue
         fi
