@@ -246,6 +246,22 @@ assert_contains "HA_ENABLED=false releases the VIP"  "$(loop_log)" "event=vip_re
 assert_contains "HA_ENABLED=false releases DHCP"     "$(calls)" "dhcp.active false"
 assert_eq       "HA_ENABLED=false ends up holding no VIP" "" "$(cat "$W/state/vip")"
 
+# A standby can already have handed DHCP back (for example after lease-sync)
+# while still retaining the VIP. The normal deactivation path must reconcile that
+# stale VIP even though current DHCP is already false, and a second cycle must be
+# an idempotent no-op.
+echo "$VIPADDR" > "$W/state/vip"; echo false > "$W/state/dhcp"
+run_loop "$_BASE_CONF
+HA_ENABLED=true
+DHCP_HA=true
+LEASE_SYNC_ENABLED=false" 1
+assert_contains "inactive standby releases a stale VIP" "$(loop_log)" "event=vip_remove"
+assert_eq "inactive standby removes stale VIP exactly once" "1" "$(grep -c 'ip addr del' "${W}/calls.log")"
+run_loop "$_BASE_CONF
+HA_ENABLED=true
+DHCP_HA=true" 1
+assert_eq "already released standby VIP remains a no-op" "0" "$(grep -c 'ip addr del' "${W}/calls.log")"
+
 # ...but the configured master keeps serving DHCP. Switching HA off is a brake on
 # failover, not an instruction to take DHCP off the LAN: a standby serves it only
 # as a failover artifact and hands it back, while the master carries on. The VIP
