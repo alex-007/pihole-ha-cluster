@@ -948,7 +948,7 @@ chmod 755 /usr/local/lib/pihole-ha/pihole-ha-cli
 printf "%b  %b Platform abstraction installed\\n" "${OVER}" "${TICK}"
 
 printf "  %b Installing scripts..." "${INFO}"
-for script in pihole-ha pihole-ha-dash pihole-ha-sync pihole-ha-sync-pull pihole-ha-inject pihole-ha-debug pihole-ha-cluster-key; do
+for script in pihole-ha pihole-ha-dash pihole-ha-sync pihole-ha-sync-pull pihole-ha-inject pihole-ha-debug pihole-ha-cluster-key pihole-ha-lease-sync; do
     cp "$SCRIPT_DIR/$script" /usr/local/bin/$script
     chmod 755 /usr/local/bin/$script
 done

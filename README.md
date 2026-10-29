@@ -692,3 +692,10 @@ python3 tests/test_docker_dhcp.py
 ```
 
 The fixture tests do not replace real FTL DORA/failover checks. They test the production Bash functions, a local HTTP API boundary, failure propagation, session cleanup, and unchanged systemd behavior.
+
+## Optional active DHCP lease snapshots
+
+`pihole-ha-lease-sync` is an opt-in building block (`LEASE_SYNC_ENABLED=true`) for snapshots of the active FTL owner's `dhcp.leases`. It uses the existing `cluster.key`, HMAC-SHA256 over data plus owner/epoch metadata, and atomic temporary-file replacement. Receivers must be DHCP-inactive; active FTL is always rejected. Verify owner, membership, freshness and HMAC, apply while DHCP is inactive, then enable DHCP. Do not evaluate snapshot contents as shell.
+
+Replication is asynchronous: leases created after the last poll may be lost, and DHCP T1 renewal remains FTL's responsibility. The feature does not solve split-brain; fencing and the existing HA health checks remain required. `/api/dhcp/leases` alone does not prove FTL loaded the file; packet-level validation is required.
+

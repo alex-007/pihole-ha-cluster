@@ -1,0 +1,49 @@
+#!/bin/bash
+# Signed, atomic DHCP lease snapshots. Source only from an active FTL owner.
+set -u
+lease_snapshot_active() {
+  local state=${1:-}
+  if [[ -n "$state" && -f "$state" ]]; then grep -qx 'active=1' "$state"
+  else [[ "$(pihole-FTL --config dhcp.active 2>/dev/null | tr -d '[:space:]')" == true ]]
+  fi
+}
+lease_snapshot_create() {
+  local leases=$1 base=$2 key=$3 owner=$4 epoch=$5 now=$6 state=${7:-} data meta sig
+  [[ -r "$leases" && -r "$key" ]] || return 1
+  lease_snapshot_active "$state" || return 1
+  data="${base}.data"; meta="${base}.meta"; sig="${base}.sig"
+  umask 077
+  cp -- "$leases" "$data.tmp" || return 1
+  printf '%s\n' "$data.tmp" | grep -q '^' || return 1
+  mv -f -- "$data.tmp" "$data" || return 1
+  printf 'owner=%s\nepoch=%s\ncreated=%s\n' "$owner" "$epoch" "$now" >"$meta.tmp" || return 1
+  mv -f -- "$meta.tmp" "$meta" || return 1
+  printf '%s  %s\n' "$(cat "$data" "$meta" | openssl dgst -sha256 -hmac "$(cat "$key")" | awk '{print $2}')" "$(basename "$data")" >"$sig.tmp" || return 1
+  mv -f -- "$sig.tmp" "$sig"
+}
+lease_snapshot_verify() {
+  local base=$1 key=$2 owner=$3 epoch=$4 now=$5 expected actual mowner mepoch created
+  [[ -r "$base.data" && -r "$base.meta" && -r "$base.sig" && -r "$key" ]] || return 1
+  expected=$(awk '{print $1}' "$base.sig")
+  actual=$(cat "$base.data" "$base.meta" | openssl dgst -sha256 -hmac "$(cat "$key")" | awk '{print $2}')
+  [[ "$expected" == "$actual" ]] || return 1
+  mowner=$(sed -n 's/^owner=//p' "$base.meta"); mepoch=$(sed -n 's/^epoch=//p' "$base.meta"); created=$(sed -n 's/^created=//p' "$base.meta")
+  [[ "$mowner" == "$owner" && "$mepoch" =~ ^[0-9]+$ && "$epoch" =~ ^[0-9]+$ && $mepoch -ge $epoch ]] || return 1
+  [[ "$created" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ && $created -le $now ]] || return 1
+}
+lease_snapshot_apply() {
+  local base=$1 dest=$2 state=${3:-}
+  lease_snapshot_active "$state" && return 1
+  [[ -r "$base.data" ]] || return 1
+  install -m 0640 "$base.data" "$dest.tmp" || return 1
+  mv -f -- "$dest.tmp" "$dest"
+}
+lease_snapshot_accept() {
+  local base=$1 last=$2 key=$3 owner=$4 epoch=$5 now=$6 previous=0
+  [[ -r "$last" ]] && previous=$(cat "$last")
+  lease_snapshot_verify "$base" "$key" "$owner" "$epoch" "$now" || return 1
+  local got; got=$(sed -n 's/^epoch=//p' "$base.meta")
+  (( got > previous )) || return 1
+  printf '%s\n' "$got" >"$last.tmp" && mv -f "$last.tmp" "$last"
+}
+if [[ "${1:-}" == create ]]; then shift; lease_snapshot_create "$@"; fi
