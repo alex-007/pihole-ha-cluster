@@ -1,49 +1,234 @@
 #!/bin/bash
-# Signed, atomic DHCP lease snapshots. Source only from an active FTL owner.
-set -u
-lease_snapshot_active() {
-  local state=${1:-}
-  if [[ -n "$state" && -f "$state" ]]; then grep -qx 'active=1' "$state"
-  else [[ "$(pihole-FTL --config dhcp.active 2>/dev/null | tr -d '[:space:]')" == true ]]
-  fi
+# Sourceable active-owner IPv4 lease replication; transport is served by dash.
+LEASE_SYNC_DIR="${LEASE_SYNC_DIR:-/etc/pihole-ha/lease-sync-state}"
+LEASE_SYNC_KEY="${LEASE_SYNC_KEY:-/etc/pihole-ha/cluster.key}"
+LEASE_SYNC_FILE="${LEASE_SYNC_FILE:-/etc/pihole/dhcp.leases}"
+LEASE_SYNC_UID="${LEASE_SYNC_UID:-1000}"
+LEASE_SYNC_GID="${LEASE_SYNC_GID:-1000}"
+LEASE_SYNC_MAX_AGE=300
+LEASE_SYNC_ENABLED=false
+LEASE_SYNC_INTERVAL=5
+
+lease_sync_load() {
+    LEASE_SYNC_ENABLED=false; LEASE_SYNC_INTERVAL=5; LEASE_SYNC_MAX_AGE=300
+    local key value
+    [[ -r "${LEASE_SYNC_CONF:-/etc/pihole-ha/lease-sync.conf}" ]] || return 0
+    while IFS='=' read -r key value; do
+        case "$key" in
+            LEASE_SYNC_ENABLED) [[ "$value" == true ]] && LEASE_SYNC_ENABLED=true ;;
+            LEASE_SYNC_INTERVAL) [[ "$value" =~ ^[0-9]{1,3}$ ]] && (( 10#$value >= 1 && 10#$value <= 300 )) && LEASE_SYNC_INTERVAL=$((10#$value)) ;;
+            LEASE_SYNC_MAX_AGE) [[ "$value" =~ ^[0-9]{1,5}$ ]] && (( 10#$value >= 5 && 10#$value <= 86400 )) && LEASE_SYNC_MAX_AGE=$((10#$value)) ;;
+        esac
+    done < "${LEASE_SYNC_CONF:-/etc/pihole-ha/lease-sync.conf}"
+    return 0
 }
-lease_snapshot_create() {
-  local leases=$1 base=$2 key=$3 owner=$4 epoch=$5 now=$6 state=${7:-} data meta sig
-  [[ -r "$leases" && -r "$key" ]] || return 1
-  lease_snapshot_active "$state" || return 1
-  data="${base}.data"; meta="${base}.meta"; sig="${base}.sig"
-  umask 077
-  cp -- "$leases" "$data.tmp" || return 1
-  printf '%s\n' "$data.tmp" | grep -q '^' || return 1
-  mv -f -- "$data.tmp" "$data" || return 1
-  printf 'owner=%s\nepoch=%s\ncreated=%s\n' "$owner" "$epoch" "$now" >"$meta.tmp" || return 1
-  mv -f -- "$meta.tmp" "$meta" || return 1
-  printf '%s  %s\n' "$(cat "$data" "$meta" | openssl dgst -sha256 -hmac "$(cat "$key")" | awk '{print $2}')" "$(basename "$data")" >"$sig.tmp" || return 1
-  mv -f -- "$sig.tmp" "$sig"
+
+lease_sync_state() {
+    if declare -F get_dhcp >/dev/null; then get_dhcp; else platform_get_dhcp; fi
 }
-lease_snapshot_verify() {
-  local base=$1 key=$2 owner=$3 epoch=$4 now=$5 expected actual mowner mepoch created
-  [[ -r "$base.data" && -r "$base.meta" && -r "$base.sig" && -r "$key" ]] || return 1
-  expected=$(awk '{print $1}' "$base.sig")
-  actual=$(cat "$base.data" "$base.meta" | openssl dgst -sha256 -hmac "$(cat "$key")" | awk '{print $2}')
-  [[ "$expected" == "$actual" ]] || return 1
-  mowner=$(sed -n 's/^owner=//p' "$base.meta"); mepoch=$(sed -n 's/^epoch=//p' "$base.meta"); created=$(sed -n 's/^created=//p' "$base.meta")
-  [[ "$mowner" == "$owner" && "$mepoch" =~ ^[0-9]+$ && "$epoch" =~ ^[0-9]+$ && $mepoch -ge $epoch ]] || return 1
-  [[ "$created" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ && $created -le $now ]] || return 1
+
+lease_sync_publish() {
+    [[ "$(lease_sync_state)" == true && -r "$LEASE_SYNC_FILE" ]] || return 1
+    local ip
+    for ip in "${NODES[@]}"; do
+        [[ "$ip" == "$LOCAL_IP" ]] && continue
+        [[ "${peer_dhcp[$ip]:-null}" == true ]] && return 1
+    done
+    local body output signature
+    mkdir -p "$LEASE_SYNC_DIR" && chmod 0700 "$LEASE_SYNC_DIR" || return 1
+    body="$(mktemp "$LEASE_SYNC_DIR/.body.XXXXXX")" || return 1
+    output="$(mktemp "$LEASE_SYNC_DIR/.publish.XXXXXX")" || { rm -f "$body"; return 1; }
+    { printf 'PHALEASE1\n%s\n%s\n' "$LOCAL_IP" "$(date +%s)"; cat "$LEASE_SYNC_FILE"; } > "$body" || { rm -f "$body" "$output"; return 1; }
+    signature="$(platform_sync_hmac "$LEASE_SYNC_KEY" < "$body")"
+    if [[ "$signature" =~ ^[a-f0-9]{64}$ ]]; then
+        { printf '%s\n' "$signature"; cat "$body"; } > "$output" || { rm -f "$body" "$output"; return 1; }
+        mv -f "$output" "$LEASE_SYNC_DIR/published" || { rm -f "$body" "$output"; return 1; }
+        cp "$LEASE_SYNC_DIR/published" "$LEASE_SYNC_DIR/cache.tmp" && mv -f "$LEASE_SYNC_DIR/cache.tmp" "$LEASE_SYNC_DIR/cache" || { rm -f "$body"; return 1; }
+    else
+        rm -f "$body" "$output"; return 1
+    fi
+    printf '%s\n' "$LOCAL_IP" > "$LEASE_SYNC_DIR/last-owner"
+    rm -f "$body"
 }
-lease_snapshot_apply() {
-  local base=$1 dest=$2 state=${3:-}
-  lease_snapshot_active "$state" && return 1
-  [[ -r "$base.data" ]] || return 1
-  install -m 0640 "$base.data" "$dest.tmp" || return 1
-  mv -f -- "$dest.tmp" "$dest"
+
+lease_sync_due() {
+    local now
+    now="$(date +%s)"
+    (( now - ${LEASE_SYNC_LAST_TICK:-0} >= LEASE_SYNC_INTERVAL )) || return 1
+    LEASE_SYNC_LAST_TICK="$now"
 }
-lease_snapshot_accept() {
-  local base=$1 last=$2 key=$3 owner=$4 epoch=$5 now=$6 previous=0
-  [[ -r "$last" ]] && previous=$(cat "$last")
-  lease_snapshot_verify "$base" "$key" "$owner" "$epoch" "$now" || return 1
-  local got; got=$(sed -n 's/^epoch=//p' "$base.meta")
-  (( got > previous )) || return 1
-  printf '%s\n' "$got" >"$last.tmp" && mv -f "$last.tmp" "$last"
+
+lease_sync_cycle() {
+    [[ "${LEASE_SYNC_ENABLED:-false}" == true ]] || return 0
+    if [[ "${LEASE_SYNC_READY:-false}" != true ]]; then lease_sync_startup; return $?; fi
+    lease_sync_handle_yield || return 1
+    [[ "$LEASE_SYNC_YIELDING" == true ]] && return 0
+    local ip owner="" count=0 current
+    current="$(lease_sync_state)"
+    [[ "$current" == true || "$current" == false ]] || return 1
+    for ip in "${NODES[@]}"; do
+        [[ "$ip" == "$LOCAL_IP" ]] && continue
+        if [[ "${peer_dhcp[$ip]:-null}" == true ]]; then owner="$ip"; (( count++ )) || true; fi
+    done
+    (( count <= 1 )) || return 1
+    if [[ "$current" == true && "$count" -gt 0 ]]; then
+        # A returning former owner must stop before learning the survivor's leases.
+        set_dhcp false || return 1
+        [[ "$(lease_sync_state)" == false ]] || return 1
+        current=false
+        LEASE_SYNC_LAST_TICK=0
+    fi
+    if [[ "$current" == true ]]; then
+        lease_sync_due || return 0
+        lease_sync_publish
+        return $?
+    fi
+    mkdir -p "$LEASE_SYNC_DIR" && chmod 0700 "$LEASE_SYNC_DIR" || return 1
+    if [[ -n "$owner" ]]; then
+        printf '%s\n' "$owner" > "$LEASE_SYNC_DIR/last-owner" || return 1
+    elif [[ -r "$LEASE_SYNC_DIR/last-owner" ]]; then
+        owner="$(cat "$LEASE_SYNC_DIR/last-owner")"
+        [[ "$owner" != "$LOCAL_IP" ]] || return 0
+    fi
+    [[ -n "$owner" ]] || return 0
+    lease_sync_member "$owner" || return 1
+    lease_sync_due || return 0
+    lease_sync_fetch "$owner"
 }
-if [[ "${1:-}" == create ]]; then shift; lease_snapshot_create "$@"; fi
+
+lease_sync_fetch() {
+    local peer="$1" forward="${2:-false}" temporary status result owner="$1"
+    temporary="$(mktemp "$LEASE_SYNC_DIR/.pull.XXXXXX")" || return 1
+    status="$(printf 'sid: %s\n' "${peer_sid[$peer]:-}" | curl --noproxy '*' -fsS --max-time 3 --max-filesize 4194304 \
+        -H @- -w '%{http_code}' "http://$peer:${LEASE_SYNC_PORT:-8887}/api/leases/snapshot" -o "$temporary")"
+    result=$?
+    if [[ "$status" == 404 ]]; then result=2
+    elif (( result == 0 )) && [[ "$status" == 200 ]]; then
+        # Startup may recover a member-signed snapshot forwarded by another member.
+        [[ "$forward" == true ]] && owner="$(sed -n '3p' "$temporary")"
+        lease_sync_import "$temporary" "$owner"; result=$?
+    else result=1; fi
+    rm -f "$temporary"
+    return "$result"
+}
+
+lease_sync_startup() {
+    local current ip result failed=0 initial=false
+    current="$(lease_sync_state)"
+    [[ "$current" == true || "$current" == false ]] || return 1
+    mkdir -p "$LEASE_SYNC_DIR" && chmod 0700 "$LEASE_SYNC_DIR" || return 1
+    if [[ "$current" == true ]]; then
+        # Only first enablement may seed from a live owner's file. A returning
+        # owner must not give its old file a new timestamp before catching up.
+        if [[ ! -f "$LEASE_SYNC_DIR/cache" ]]; then
+            lease_sync_publish && initial=true
+        fi
+        LEASE_SYNC_STARTING=true
+        if ! set_dhcp false; then LEASE_SYNC_STARTING=false; return 1; fi
+        LEASE_SYNC_STARTING=false
+    fi
+    [[ "$(lease_sync_state)" == false ]] || return 1
+    for ip in "${NODES[@]}"; do
+        [[ "$ip" == "$LOCAL_IP" ]] && continue
+        lease_sync_fetch "$ip" true; result=$?
+        if (( result == 1 )) && [[ "$initial" != true ]]; then
+            if declare -p peer_api >/dev/null 2>&1 && [[ "${peer_api[$ip]:-false}" == true ]]; then failed=1; fi
+        fi
+    done
+    (( failed == 0 )) && [[ -r "$LEASE_SYNC_DIR/cache" ]] || return 1
+    LEASE_SYNC_READY=true
+    LEASE_SYNC_LAST_TICK=0
+}
+
+lease_sync_handle_yield() {
+    LEASE_SYNC_YIELDING=false
+    [[ -r "$LEASE_SYNC_DIR/yield" ]] || return 0
+    local target deadline now
+    read -r target deadline < "$LEASE_SYNC_DIR/yield" || return 1
+    now="$(date +%s)"
+    if ! lease_sync_member "$target" || [[ ! "$deadline" =~ ^[0-9]{1,12}$ ]] || (( 10#$deadline <= now )); then
+        rm -f "$LEASE_SYNC_DIR/yield"; return 0
+    fi
+    if [[ "${peer_dhcp[$target]:-false}" == true ]]; then
+        rm -f "$LEASE_SYNC_DIR/yield"; return 0
+    fi
+    if [[ "$(lease_sync_state)" == true ]]; then set_dhcp false || return 1; fi
+    remove_vip
+    LEASE_SYNC_YIELDING=true
+}
+
+lease_sync_request_yield() {
+    local peer="$1"
+    printf 'sid: %s\n' "${peer_sid[$peer]:-}" | curl --noproxy '*' -fsS --max-time 3 -H @- \
+        -X POST "http://$peer:${LEASE_SYNC_PORT:-8887}/api/leases/yield?target=$LOCAL_IP" -o /dev/null
+}
+
+lease_sync_member() {
+    local ip
+    is_valid_ip "$1" || return 1
+    for ip in "${NODES[@]}"; do [[ "$ip" == "$1" ]] && return 0; done
+    return 1
+}
+
+lease_sync_import() {
+    local snapshot="$1" owner="$2" signature actual dest created now
+    [[ "$(lease_sync_state)" == false && -r "$snapshot" ]] || return 1
+    lease_sync_member "$owner" || return 1
+    created="$(sed -n '4p' "$snapshot")"; now="$(date +%s)"
+    [[ "$created" =~ ^[0-9]{1,12}$ ]] || return 1
+    (( 10#$created <= now + 5 && now - 10#$created <= LEASE_SYNC_MAX_AGE )) || return 1
+    signature="$(sed -n '1p' "$snapshot")"
+    actual="$(sed '1d' "$snapshot" | platform_sync_hmac "$LEASE_SYNC_KEY")"
+    [[ "$signature" =~ ^[a-f0-9]{64}$ && "$actual" == "$signature" ]] || return 1
+    [[ "$(sed -n '2p' "$snapshot")" == PHALEASE1 && "$(sed -n '3p' "$snapshot")" == "$owner" ]] || return 1
+    if [[ -r "$LEASE_SYNC_DIR/cache" ]]; then
+        local previous
+        previous="$(sed -n '4p' "$LEASE_SYNC_DIR/cache")"
+        [[ "$previous" =~ ^[0-9]{1,12}$ ]] || return 1
+        (( 10#$created >= 10#$previous )) || return 3  # authenticated but older
+        if (( 10#$created == 10#$previous )); then
+            cmp -s "$snapshot" "$LEASE_SYNC_DIR/cache" || return 1
+        fi
+    fi
+    dest="$(mktemp "${LEASE_SYNC_FILE}.XXXXXX")" || return 1
+    if ! sed -n '5,$p' "$snapshot" | awk -v now="$now" '
+        NF != 5 || $1 !~ /^[0-9]+$/ { bad=1; next }
+        $1 == 0 || $1 > now { print }
+        END { exit bad }
+    ' > "$dest"; then rm -f "$dest"; return 1; fi
+    if ! chown "$LEASE_SYNC_UID:$LEASE_SYNC_GID" "$dest" || ! chmod 0640 "$dest"; then
+        rm -f "$dest"; return 1
+    fi
+    [[ "$(lease_sync_state)" == false ]] || { rm -f "$dest"; return 1; }
+    mv -f "$dest" "$LEASE_SYNC_FILE" || { rm -f "$dest"; return 1; }
+    cp "$snapshot" "$LEASE_SYNC_DIR/cache.tmp" && mv -f "$LEASE_SYNC_DIR/cache.tmp" "$LEASE_SYNC_DIR/cache" || return 1
+    printf '%s\n' "$owner" > "$LEASE_SYNC_DIR/last-owner"
+}
+
+lease_sync_activate() {
+    if ! lease_sync_prepare; then
+        log_warn "event=lease_takeover_blocked reason=missing_or_invalid_snapshot_or_peer_still_active"
+        return 1
+    fi
+    add_vip  # Preserve upstream's best-effort VIP handling.
+    set_dhcp true
+}
+
+lease_sync_prepare() {
+    [[ "${LEASE_SYNC_ENABLED:-false}" == true ]] || return 0
+    [[ "${LEASE_SYNC_READY:-false}" == true ]] || return 1
+    local ip owner
+    [[ -r "$LEASE_SYNC_DIR/cache" ]] || return 1
+    owner="$(sed -n '3p' "$LEASE_SYNC_DIR/cache")"
+    if [[ -r "$LEASE_SYNC_DIR/last-owner" ]]; then
+        [[ "$(cat "$LEASE_SYNC_DIR/last-owner")" == "$owner" ]] || return 1
+    fi
+    lease_sync_import "$LEASE_SYNC_DIR/cache" "$owner" || return 1
+    for ip in "${NODES[@]}"; do
+        [[ "$ip" == "$LOCAL_IP" ]] && continue
+        if [[ "${peer_dhcp[$ip]:-null}" == true ]]; then
+            lease_sync_request_yield "$ip" || true
+            return 1
+        fi
+    done
+}

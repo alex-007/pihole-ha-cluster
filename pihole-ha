@@ -23,6 +23,15 @@ for _p in /usr/local/lib/pihole-ha/pihole-ha-platform ./pihole-ha-platform; do
     [[ -f "$_p" ]] && { . "$_p"; break; }
 done
 
+# Load the packaged lease-sync module (disabled unless explicitly configured).
+for _p in /usr/local/bin/pihole-ha-lease-sync ./pihole-ha-lease-sync; do
+    [[ -f "$_p" ]] && { . "$_p"; break; }
+done
+if ! declare -F lease_sync_cycle >/dev/null; then
+    printf '%s\n' 'Missing pihole-ha-lease-sync; reinstall the complete package' >&2
+    exit 1
+fi
+
 # Load node config (with backwards-compatible defaults)
 NODES_CONF="/etc/pihole-ha/nodes.conf"
 GATEWAY="" VIP="" VIP_ENABLED="" HA_ENABLED="" HA_NODES="" DHCP_HA=""
@@ -653,6 +662,9 @@ set_dhcp() {
     local want="$1" have
     have="$(get_dhcp)"
     [[ "$have" == "$want" ]] && return 0
+    if [[ "$want" == false && "${LEASE_SYNC_ENABLED:-false}" == true && "${LEASE_SYNC_STARTING:-false}" != true ]]; then
+        lease_sync_publish || true  # best-effort final snapshot; never delay standing down
+    fi
     platform_set_dhcp "$want"
     sleep 1
     have="$(get_dhcp)"
@@ -1602,6 +1614,16 @@ while true; do
     update_publish_liveness
     manage_sync_role
 
+    # Lightweight leases have their own timer; never wait for a gravity rebuild.
+    lease_sync_load
+    if [[ "$DHCP_HA" == true && "$HA_ENABLED" == true ]] && (( MY_IDX >= 0 )); then
+        lease_sync_cycle || log_warn "event=lease_sync status=deferred reason=unavailable_or_rejected_snapshot"
+        if [[ "$LEASE_SYNC_ENABLED" == true && "${LEASE_SYNC_YIELDING:-false}" == true ]]; then
+            write_status "Lease handover: waiting for the ready peer"
+            continue
+        fi
+    fi
+
     # STANDBY_ONLY: never take over, whatever the peers look like, in any mode.
     # Asked for after a cluster where a node that could not authenticate promoted
     # itself, seized DHCP and the VIP, and fought the healthy primary — leaving no
@@ -1713,8 +1735,8 @@ while true; do
         if (( activate_count >= ACTIVATE_AFTER )); then
             reason="$(build_reason)"
             log_info "event=dhcp_activate reason=\"$reason\""
-            add_vip
-            if set_dhcp "true"; then
+            # Import a verified snapshot before claiming VIP or starting DHCP.
+            if lease_sync_activate; then
                 vip_msg=""
                 [[ "$VIP_ENABLED" == "true" ]] && vip_msg=" <br> VIP <b>$VIP</b> acquired"
                 # Build detailed per-node health breakdown for notification

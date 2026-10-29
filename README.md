@@ -683,7 +683,7 @@ This fork carries the Docker fixes used in a tested Pi-hole FTL v6.8 deployment:
 - Change Docker DHCP activation through the running FTL API using the configured `PIHOLE_PASSWORD` / `PIHOLE_HA_API_PASSWORD` and `PIHOLE_WEB_PORT`. Do not rely on a CLI disk-config write to activate the running DHCP server. Systemd retains the upstream CLI path.
 - Include the `pihole` UID/GID 1000 in the sidecar so sync-created files remain readable by the official Pi-hole container.
 
-`SYNC_DHCP` still syncs reservations, not active leases. Active lease replication is a separate planned change and is not implemented by these fixes.
+`SYNC_DHCP` still syncs reservations, not active leases. Active lease replication is a separate, opt-in feature described below.
 
 Run the focused function/HTTP-fixture regressions with:
 
@@ -695,7 +695,34 @@ The fixture tests do not replace real FTL DORA/failover checks. They test the pr
 
 ## Optional active DHCP lease snapshots
 
-`pihole-ha-lease-sync` is an opt-in building block (`LEASE_SYNC_ENABLED=true`) for snapshots of the active FTL owner's `dhcp.leases`. It uses the existing `cluster.key`, HMAC-SHA256 over data plus owner/epoch metadata, and atomic temporary-file replacement. Receivers must be DHCP-inactive; active FTL is always rejected. Verify owner, membership, freshness and HMAC, apply while DHCP is inactive, then enable DHCP. Do not evaluate snapshot contents as shell.
+`pihole-ha-lease-sync` adds lightweight, signed IPv4 snapshots of the actual DHCP owner's `/etc/pihole/dhcp.leases`. It runs from the HA health loop independently of config/gravity synchronization, not from a fixed `SYNC_PRIMARY`. It is **disabled by default**.
 
-Replication is asynchronous: leases created after the last poll may be lost, and DHCP T1 renewal remains FTL's responsibility. The feature does not solve split-brain; fencing and the existing HA health checks remain required. `/api/dhcp/leases` alone does not prove FTL loaded the file; packet-level validation is required.
+To opt in, place the following in `/etc/pihole-ha/lease-sync.conf` on **every node**, after installing the reviewed image/package:
+
+```ini
+LEASE_SYNC_ENABLED=true
+LEASE_SYNC_INTERVAL=5
+LEASE_SYNC_MAX_AGE=300
+```
+
+Use the same existing `cluster.key` and valid peer Pi-hole credentials on every node. The interval is a minimum in seconds; actual transfers are scheduled on health-check ticks (`CHECK_INTERVAL`, default 10 seconds) and include probe time. This does not create a second background scheduler. Config values are parsed, never evaluated as shell. This file is deliberately independent of the slower config-sync bundle and must be configured on each member.
+
+### Replication and takeover
+
+- Only an active node with no other observed active owner publishes a new snapshot. HMAC-SHA256 covers the format version, owner address, creation time, and lease bytes, using the existing signing helper.
+- `GET /api/leases/snapshot` serves the immutable snapshot over the existing dash listener. On password-protected Pi-hole it requires a valid Pi-hole session, sent in the `sid` header. The final signed snapshot remains available after stand-down so the next owner can finish catching up.
+- A receiver selects the actual owner from the daemon's authenticated DHCP health results. It accepts only cluster members, valid signatures, recent timestamps (up to five seconds of forward clock skew), and no rollback behind its latest cached snapshot. Keep host clocks synchronized.
+- A receiver must report DHCP **false**, not unknown, both before validation and immediately before installation. Leases are replaced atomically with UID/GID `1000:1000` and mode `0640`. Expired records are dropped without extending expiry times; an empty authoritative snapshot clears released leases. No lease data is executed or extracted as an archive.
+- State is persisted privately under `/etc/pihole-ha/lease-sync-state/`, inside the existing HA-config mount. A node that discovers another active owner stands down before receiving. Remembering the last observed owner prevents a returning node from resuming its own stale snapshot after a failed catch-up.
+- Immediately before takeover, the daemon revalidates and reinstalls the cache, **then** claims VIP and activates DHCP. It waits while another node is still observed active. With the feature enabled, a missing, expired, invalid, or wrong-owner cache blocks automatic activation rather than starting from unknown lease state. This applies to Docker's live API activation; the existing systemd activation path is unchanged and needs deployment-specific packet validation.
+
+### Bootstrap and recovery
+
+For the initial enablement, leave the existing DHCP owner serving, install/enable replication there and on the standby, and verify that the standby receives a signed cache before testing failure. Do not enable two cold, empty nodes and expect them to elect an authoritative initial lease database. After a prolonged whole-cluster outage exceeding `LEASE_SYNC_MAX_AGE`, inspect the retained lease files and deliberately establish one correct owner before resuming normal replication. Increasing the age limit trades freshness for availability; it is not a repair for divergent leases.
+
+### Limits and tests
+
+Replication is asynchronous: leases or releases after the last successful transfer can be missed. It does not redirect T1 requests to a failed node's successor and does not add quorum/fencing or eliminate split-brain. This first version targets the IPv4 five-field lease file; DHCPv6/DUID records are not supported. Peer configuration and clocks must agree. A stale snapshot can block takeover intentionally. Replacing an inactive node's file is not a live DNS/PTR import into its running DHCP-disabled engine.
+
+Run `python3 tests/test_lease_sync_integration.py` and `python3 tests/test_docker_dhcp.py` for the function/HTTP regressions. Real FTL packet tests are additionally required: `/api/dhcp/leases` can show file records while DHCP is inactive and alone does not prove the DHCP engine loaded them.
 
