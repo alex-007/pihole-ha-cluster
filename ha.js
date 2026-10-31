@@ -31,6 +31,7 @@ $(function () {
     }
 
     var statusData = null;
+    var agentStatus = {};
     var prevReach = {};        // per-node last-seen reachability (for redshift/blueshift)
     var syncCfg = null;
     var syncManifest = null;
@@ -48,6 +49,7 @@ $(function () {
 
     // Initial polls
     pollStatus();
+    pollAgentStatus();
     pollSync();
     pollNotify();
     pollMaster();
@@ -57,6 +59,7 @@ $(function () {
 
     // Periodic polling
     setInterval(pollStatus, 5000);
+    setInterval(pollAgentStatus, 5000);
     setInterval(pollSync, 15000);
     setInterval(pollNotify, 15000);
     setInterval(pollMaster, 5000);
@@ -130,6 +133,21 @@ $(function () {
             renderOverview();
             renderHealth();
         });
+    }
+
+    function pollAgentStatus() {
+        $.each(NODES, function (i, node) {
+            $.ajax({url: API + "?action=agent-status&ip=" + encodeURIComponent(node.ip), timeout: 2500, dataType: "json"})
+                .done(function (data) { agentStatus[node.ip] = data || {state: "unknown"}; })
+                .fail(function () { agentStatus[node.ip] = {state: "unknown"}; })
+                .always(function () { renderAgentStatus(node.ip); });
+        });
+    }
+
+    function renderAgentStatus(ip) {
+        var data = agentStatus[ip] || {state: "unknown"};
+        var labels = {running: "Running", stopped: "Stopped", unknown: "Unknown"};
+        $("[data-agent-status='" + ip + "']").text("HA agent: " + (labels[data.state] || "Unknown"));
     }
 
     // ---- Sync polling ----
