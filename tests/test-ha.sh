@@ -221,6 +221,43 @@ DHCP_MASTER="10.33.47.55"; LOCAL_IP="10.33.47.3"; MY_IDX=1
 should_i_serve >/dev/null 2>&1
 assert_eq "valid pin left untouched" "10.33.47.55" "$DHCP_MASTER"
 
+# ============================================================
+echo
+echo "=== Graceful shutdown ownership release ==="
+
+eval "$(extract_fn "$HA_SRC" _shutdown_release)"
+_shutdown_events="$(mktemp)"
+release_all_sids() { printf 'sids\n' >> "$_shutdown_events"; }
+get_dhcp() { cat "$_shutdown_state"; }
+set_dhcp() { printf '%s\n' "$1" >> "$_shutdown_events"; printf '%s' "$1" > "$_shutdown_state"; }
+has_vip() { [[ -f "$_shutdown_vip" ]]; }
+remove_vip() {
+    printf 'vip\n' >> "$_shutdown_events"
+    rm -f "$_shutdown_vip"
+}
+log_info() { :; }
+HA_ENABLED=true; DHCP_HA=true; VIP=192.0.2.9
+_shutdown_state="$(mktemp)"; _shutdown_vip="$(mktemp)"
+printf true > "$_shutdown_state"
+_shutdown_release
+assert_eq "shutdown disables DHCP before VIP release" $'false\nsids\nvip' "$(cat "$_shutdown_events")"
+assert_eq "shutdown leaves DHCP disabled" false "$(cat "$_shutdown_state")"
+
+: > "$_shutdown_events"; printf true > "$_shutdown_state"; : > "$_shutdown_vip"
+set_dhcp() { printf 'set_dhcp\n' >> "$_shutdown_events"; return 1; }
+_shutdown_release
+assert_eq "failed DHCP handoff does not remove VIP" $'set_dhcp' "$(cat "$_shutdown_events")"
+assert_true "failed DHCP handoff keeps VIP" test -f "$_shutdown_vip"
+
+set_dhcp() { printf 'unexpected-set-dhcp\n' >> "$_shutdown_events"; return 1; }
+for _mode in "HA_ENABLED=false" "DHCP_HA=false"; do
+    eval "$_mode"; : > "$_shutdown_events"; printf true > "$_shutdown_state"; : > "$_shutdown_vip"
+    _shutdown_release
+    assert_eq "$_mode leaves DHCP untouched" $'sids\nvip' "$(cat "$_shutdown_events")"
+    assert_eq "$_mode leaves DHCP enabled" true "$(cat "$_shutdown_state")"
+done
+rm -f "$_shutdown_events" "$_shutdown_state" "$_shutdown_vip"
+
 DHCP_MASTER="auto"; LOCAL_IP="10.33.47.3"; MY_IDX=1
 assert_false "auto: standby yields while P1 healthy" should_i_serve
 peer_dhcp["10.33.47.55"]="false"

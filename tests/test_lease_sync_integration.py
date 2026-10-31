@@ -218,13 +218,13 @@ exec bash ./pihole-ha-dash --handle
         self.assertNotEqual(result.returncode, 0)  # Transfer deliberately unavailable.
         self.assertEqual((self.root / 'state').read_text(), 'false')
 
-    def test_fresh_local_cache_survives_observed_peer_failback_without_blocking_marker(self):
+    def test_observed_peer_failback_without_catchup_marker_keeps_local_cache_blocked(self):
         self.publish()
         (self.root / 'state').write_text('false')
-        (self.root / 'runtime/last-owner').write_text('192.0.2.2\\n')
+        (self.root / 'runtime/last-owner').write_text('192.0.2.2\n')
         (self.root / 'runtime/cache').write_bytes((self.root / 'runtime/published').read_bytes())
-        self.assert_success(self.shell('lease_sync_prepare'))
-        self.assertIn('192.0.2.100', (self.root / 'leases').read_text())
+        self.assertNotEqual(self.shell('lease_sync_prepare').returncode, 0)
+        self.assertEqual((self.root / 'leases').read_text(), '0 02:00:00:00:00:01 192.0.2.100 fixture *\n')
 
     def test_failed_peer_catchup_keeps_local_cache_blocked(self):
         self.publish()
