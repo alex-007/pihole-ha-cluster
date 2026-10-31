@@ -1004,6 +1004,172 @@ assert_contains "the dashboard uses the peer's recorded port" \
     "$_dash_src" '${_NODE_PORTS[$ip]:-80}/api/auth'
 
 # ============================================================
+# A node must be able to be told its own address
+# ------------------------------------------------------------
+# Identity is detected from the addresses this process can see. That is the
+# host's on a normal install and the container's on a bridge network — a 172.x
+# that matches no HA_NODES entry, so the daemon exits "Unknown IP" with no way
+# to correct it (Discourse 86667 #151).
+_ip_override() { PIHOLE_HA_LOCAL_IP="$1" bash -c '
+    source "'"$SCRIPT_DIR"'/../pihole-ha-platform"
+    hostname() { [[ "$1" == -I ]] && echo "172.18.0.5"; }
+    ip() { :; }
+    platform_get_local_ip'; }
+assert_eq "an explicit node address is used"      "192.168.1.10" "$(_ip_override 192.168.1.10)"
+assert_eq "a malformed one is ignored, not trusted" "172.18.0.5"  "$(_ip_override 'not-an-ip')"
+assert_eq "unset leaves detection alone"            "172.18.0.5"  "$(_ip_override '')"
+assert_contains "the bridge-network setup is documented" \
+    "$(cat "$SCRIPT_DIR/../docker/README.md")" "PIHOLE_HA_LOCAL_IP"
+
+# ============================================================
+# Taking the VIP must actually be announced on the LAN
+# ------------------------------------------------------------
+# Captured on a live interface, the old `arping -U -c3 -I <iface> <VIP>` put
+# this on the wire:
+#
+#   ARP, Request who-has <VIP> (ff:ff:ff:ff:ff:ff) tell <node address>
+#
+# A request FOR the VIP from the node's own address — nothing learns the new
+# MAC from it. Habets arping (the "arping" package on Alpine and Debian)
+# defaults the sender to the interface address and only -S overrides it, while
+# iputils-arping's -U sets sender = target. So whether a failover was announced
+# at all depended on which implementation happened to be installed, and where
+# it was not, clients kept the old MAC until their ARP entry aged out — minutes
+# (Discourse 86667 #150: "the VIP came back but did not answer for several
+# minutes"). The fixed command emits "who-has <VIP> tell <VIP>", verified with
+# tcpdump.
+_announce_probe() {   # $1 = arping identity line, $2 = exit code, $3 = output
+    # The function captures arping's output, so the stub records what it was
+    # called with in a file rather than on stdout, which never comes back.
+    local log; log="$(mktemp)"
+    P_LOG="$log" P_ID="$1" P_RC="$2" P_OUT="$3" bash -c '
+        VIP=10.0.0.9; IFACE=eth0
+        log_info() { echo "INFO $*"; }; log_warn() { echo "WARN $*"; }
+        arping() {
+            if [[ "$1" == "-h" ]]; then printf "%s\n" "$P_ID"; return 0; fi
+            echo "CMD: $*" >> "$P_LOG"
+            printf "%s\n" "$P_OUT"
+            return "$P_RC"
+        }
+        command() { [[ "$1" == "-v" && "$2" == "arping" ]] && return 0; builtin command "$@"; }
+        sleep() { :; }
+        '"$(extract_fn "$SCRIPT_DIR/../pihole-ha" announce_vip)"'
+        announce_vip
+    '
+    cat "$log"; rm -f "$log"
+}
+_hab="ARPing 2.25, by Thomas Habets <thomas@habets.se>"
+_ipu="Usage: arping [-fqbDUAV] [-c count] ... (iputils)"
+_quiet="ARPING 10.0.0.9 Timeout --- 10.0.0.9 statistics --- 3 packets transmitted, 0 packets received"
+assert_contains "Habets arping is told which address to announce" \
+    "$(_announce_probe "$_hab" 1 "$_quiet")" "-S 10.0.0.9"
+assert_not_contains "iputils arping is not given -S, its -U already does it" \
+    "$(_announce_probe "$_ipu" 0 "$_quiet")" "-S 10.0.0.9"
+assert_contains "the announcement names the interface" \
+    "$(_announce_probe "$_hab" 1 "$_quiet")" "-I eth0"
+# Nobody answers an announcement, so "0 packets received" is success, not failure.
+assert_contains "no replies is not treated as a failure" \
+    "$(_announce_probe "$_hab" 1 "$_quiet")" "status=ok"
+# A real error says so on stderr instead of counting replies.
+assert_contains "a genuine arping error is reported" \
+    "$(_announce_probe "$_hab" 2 "arping: Unknown iface eth0")" "status=failed"
+# Two bursts: one can land while the previous holder is still answering.
+assert_eq "it announces twice" "2" \
+    "$(_announce_probe "$_hab" 1 "$_quiet" | grep -c '^CMD: ')"
+# And if arping is not installed at all, say what the consequence is.
+assert_contains "a missing arping is called out" \
+    "$(bash -c '
+        VIP=10.0.0.9; IFACE=eth0
+        log_warn() { echo "WARN $*"; }; log_info() { echo "INFO $*"; }
+        command() { [[ "$1" == "-v" && "$2" == "arping" ]] && return 1; builtin command "$@"; }
+        '"$(extract_fn "$SCRIPT_DIR/../pihole-ha" announce_vip)"'
+        announce_vip')" "arping is not installed"
+assert_contains "taking the VIP triggers the announcement" \
+    "$(extract_fn "$SCRIPT_DIR/../pihole-ha" add_vip)" "announce_vip"
+
+# ============================================================
+# "Last synced" must answer "is sync alive", not "when did it last change"
+# ------------------------------------------------------------
+# The timestamp was only recorded on the paths that downloaded a payload, so in
+# the steady state -- remote hash unchanged, which is almost always -- the
+# puller exited early and recorded nothing. A user watched it sit at 11:55 for
+# four hours on a healthy cluster and reasonably asked why (Discourse 86667
+# #148). It is the same complaint he had about "Last build", in the line I
+# added to answer it.
+_pullmark_probe() {   # $1 = the log event to look for around the exit
+    grep -B4 "$1" "$SCRIPT_DIR/../pihole-ha-sync-pull" | grep -c '_record_pull' || true
+}
+assert_eq "the steady-state check records a successful sync" "1" \
+    "$(_pullmark_probe 'reason=\\"already up to date\\"')"
+assert_eq "so does a pull that applied something" "1" "$(_pullmark_probe 'status=applied')"
+# Failures must NOT look like a successful sync.
+assert_eq "a peer with no manifest records nothing" "0" \
+    "$(_pullmark_probe 'reason=\\"no peer has a manifest\\"')"
+assert_eq "an unparseable manifest records nothing" "0" \
+    "$(_pullmark_probe 'reason=\\"could not parse manifest\\"')"
+assert_eq "a refused rollback records nothing" "0" "$(_pullmark_probe 'event=pull_reject_older')"
+# One definition, early enough for every caller.
+assert_eq "the recorder is defined once" "1" \
+    "$(grep -c '^_record_pull() {' "$SCRIPT_DIR/../pihole-ha-sync-pull")"
+
+# ============================================================
+# "Nothing changed" is no reason to skip when there is nothing published
+# ------------------------------------------------------------
+# The hash the publisher compares against and the payload it serves lived in
+# different places — on Docker the hash was on a volume and /var/lib/pihole-ha
+# was not — so a recreated container came back believing it was up to date
+# while serving nothing. Standbys then log "no peer has a manifest" until some
+# unrelated change happens to trigger a build. A Docker user's "Last build"
+# vanished after a redeploy and never came back (Discourse 86667 #146).
+_skip_probe() {   # $1 = "present" or "missing"
+    local dir; dir="$(mktemp -d)"
+    if [[ "$1" == present ]]; then echo payload > "$dir/p"; echo manifest > "$dir/m"; fi
+    PAYLOAD_FILE="$dir/p" MANIFEST_FILE="$dir/m" bash -c '
+        CURRENT=abc; PREVIOUS=abc; FORCE=false
+        log_info() { echo "INFO $*"; }; log_warn() { echo "WARN $*"; }
+        '"$(sed -n '/^if \[\[ "\$CURRENT" == "\$PREVIOUS" && "\$FORCE" != "true" \]\]; then/,/^fi$/p' "$SCRIPT_DIR/../pihole-ha-sync")"'
+        echo "reached-the-build"
+    '
+    rm -rf "$dir"
+}
+assert_contains "an unchanged config with a payload still skips" "$(_skip_probe present)" "no changes"
+assert_not_contains "and does not reach the build"               "$(_skip_probe present)" "reached-the-build"
+assert_contains "a missing payload rebuilds instead of skipping" "$(_skip_probe missing)" "reached-the-build"
+assert_contains "and says why"                                   "$(_skip_probe missing)" "event=rebuild"
+# ...which only matters because the payload now survives a redeploy at all.
+assert_contains "the compose keeps the payload on a volume" \
+    "$(cat "$SCRIPT_DIR/../docker/docker-compose.yml")" "pihole-ha-blob:/var/lib/pihole-ha"
+assert_contains "and the docs example does too" \
+    "$(cat "$SCRIPT_DIR/../docker/README.md")" "pihole-ha-blob:/var/lib/pihole-ha"
+# A publisher has no "last synced" — say so rather than leaving a blank label.
+assert_contains "a publisher explains its empty sync time" \
+    "$(cat "$SCRIPT_DIR/../ha.js")" "this node publishes (never pulls)"
+
+# ============================================================
+# Everything the sidecar stages must actually be in the sidecar image
+# ------------------------------------------------------------
+# The entrypoint staged /usr/local/share/pihole-ha/VERSION into the shared
+# volume for the panel to pick up, the Dockerfile never copied it into the
+# image, and the copy ended in "|| true" — so for three releases every Docker
+# install read "Pi-hole HA vunknown" and nothing said why. My own end-to-end
+# test passed because the fixture supplied the file the image lacked
+# (Discourse 86667 #144).
+#
+# Derived, not listed: whatever the entrypoint stages from that directory has
+# to be COPYed into the image, so the next addition cannot repeat this.
+_staged_files="$(grep -oE '^ *_stage [A-Za-z0-9._-]+' "$SCRIPT_DIR/../docker/docker-entrypoint.sh" | awk '{print $2}' | sort -u)"
+assert_contains "the entrypoint stages the version file" "$_staged_files" "VERSION"
+for _f in $_staged_files; do
+    assert_contains "the image contains $_f, which the entrypoint stages" \
+        "$(cat "$SCRIPT_DIR/../docker/Dockerfile")" "/usr/local/share/pihole-ha/$_f"
+done
+# And a missing one must be audible rather than swallowed.
+assert_contains "a file missing from the image is reported" \
+    "$(cat "$SCRIPT_DIR/../docker/docker-entrypoint.sh")" "event=stage_missing"
+assert_not_contains "staging no longer discards its errors" \
+    "$(cat "$SCRIPT_DIR/../docker/docker-entrypoint.sh")" 'cp /usr/local/share/pihole-ha/VERSION /pihole-ha-src/ 2>/dev/null || true'
+
+# ============================================================
 # A DNS-only cluster must not label every node "Standby"
 # ------------------------------------------------------------
 # The node cards were labelled from dhcp_active alone. On a DNS-only cluster no
@@ -1067,7 +1233,7 @@ for _path in $_lp_reads; do
         /usr/local/share/pihole-ha/VERSION)
             # Not a mount: the sidecar stages it and the inject copies it in.
             assert_contains "the sidecar stages the version file" \
-                "$(cat "$SCRIPT_DIR/../docker/docker-entrypoint.sh")" "cp /usr/local/share/pihole-ha/VERSION /pihole-ha-src/"
+                "$(cat "$SCRIPT_DIR/../docker/docker-entrypoint.sh")" "_stage VERSION"
             assert_contains "and the inject installs it where ha.lp reads it" \
                 "$(cat "$SCRIPT_DIR/../docker/pihole-ha-inject-docker.sh")" 'cp "$SRCDIR/VERSION" /usr/local/share/pihole-ha/VERSION' ;;
     esac

@@ -429,6 +429,16 @@ notify() {
 
 platform_get_local_ip() {
     local _all _ip _nodes _vip
+    # An explicit answer wins. Detection reads the addresses this process can
+    # see, which is the host's on a normal install but the container's on a
+    # bridge network — a 172.x address that matches no HA_NODES entry, so the
+    # daemon exits with "Unknown IP" and there is nothing the operator can do
+    # about it. Asked on the forum by someone running Pi-hole in bridge mode
+    # with a dhcp-helper, who cannot switch to host networking.
+    if [[ -n "${PIHOLE_HA_LOCAL_IP:-}" ]] && is_valid_ip "${PIHOLE_HA_LOCAL_IP}"; then
+        printf '%s' "$PIHOLE_HA_LOCAL_IP"
+        return 0
+    fi
     # hostname -I works on Debian/Ubuntu but not Alpine BusyBox
     if hostname -I &>/dev/null; then
         _all="$(hostname -I 2>/dev/null)"

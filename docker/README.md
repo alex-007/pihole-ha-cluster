@@ -123,12 +123,15 @@ services:
       - ./etc-dnsmasq:/etc/dnsmasq.d
       - pihole-ha-conf:/etc/pihole-ha
       - pihole-ha-run:/run/pihole-ha
+      - pihole-ha-blob:/var/lib/pihole-ha  # built payload + manifest; without
+                                           # this a redeploy destroys them
       - pihole-ha-src:/pihole-ha-src   # sidecar stages the panel here (rw)
     restart: unless-stopped
 
 volumes:
   pihole-ha-conf:
   pihole-ha-run:
+  pihole-ha-blob:
   pihole-ha-src:
 ```
 
@@ -137,6 +140,38 @@ volumes:
 > `/etc/pihole-ha` or `/run/pihole-ha` — the VIP address, the node list, the
 > Config Sync panel — comes from those two read-only mounts on the **Pi-hole**
 > service, not from the sidecar's copies.
+
+### Keeping Pi-hole on a bridge network
+
+The sidecar itself must run `network_mode: host`: it identifies this node by
+its LAN address, and a VIP has to be added to the host's interface to mean
+anything. **Your Pi-hole container does not have to change.** A Pi-hole on a
+bridge network publishing `53:53` (and its web port) binds those on every host
+address, so a VIP the sidecar adds to the host NIC is answered by it.
+
+```yaml
+  pihole-ha:
+    image: pihole-ha:local
+    network_mode: host          # the sidecar only
+    pid: "service:pihole"       # your Pi-hole service's name
+    environment:
+      PIHOLE_HA_LOCAL_IP: 192.168.1.10   # see below
+      PIHOLE_WEB_PORT: 8080              # the HOST port Pi-hole is published on
+```
+
+`PIHOLE_HA_LOCAL_IP` is this node's LAN address. Detection reads the addresses
+the process can see, which is right on a host-mode sidecar and wrong anywhere
+else, so set it explicitly if the daemon logs `Unknown IP`.
+
+Two caveats. Peers reach this node's Pi-hole API on the **published** port, so
+list it in `PIHOLE_HA_NODES` as `IP:PORT`. And DHCP failover with a relay such
+as `dhcp-helper` in front of a bridged Pi-hole is untested here — the toggling
+of `dhcp.active` is just FTL config and should work, but nobody has reported
+back on it.
+
+Don't run `docker-install.sh` for this: it rewrites your Pi-hole service to
+host networking, which is the thing you are avoiding. Add the sidecar service
+by hand as above.
 
 ### If this node's Pi-hole is also the host's DNS
 
@@ -264,6 +299,16 @@ Same value on both — the node whose IP comes first in the list is primary.
 ## Admin Panel Integration
 
 The HA page is automatically injected into Pi-hole's admin UI at container startup. Access it at `http://<node-ip>:<pihole-port>/admin/ha`. The sidecar stages the HA source files to a shared volume, and an inject script running in the Pi-hole container copies them to the web root and patches the sidebar.
+
+**After rebuilding the sidecar image, restart the Pi-hole container too.** The
+panel files live inside the Pi-hole container and are refreshed only by its own
+entrypoint, so a rebuilt sidecar alone leaves the old page in place — the
+version, the node labels and the Config Sync panel all come from those copies.
+Check what is actually installed there:
+
+```bash
+docker exec <pihole-container> cat /usr/local/share/pihole-ha/VERSION
+```
 
 If the HA page disappears after a Pi-hole container rebuild, restart both containers:
 ```bash
