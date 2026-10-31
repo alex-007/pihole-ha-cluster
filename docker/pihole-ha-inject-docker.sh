@@ -63,6 +63,26 @@ inject_ha() {
     echo "pihole-ha-inject: sidebar patched — HA Cluster menu added"
 }
 
+# A returning container must not serve persisted DHCP leases before its HA
+# agent has validated the current owner's signed lease state. This executes
+# inside the Pi-hole container, before start.sh/FTL, even if the sidecar is down.
+_ha_nodes_conf="${PIHOLE_HA_NODES_CONF:-/etc/pihole-ha/nodes.conf}"
+if [[ -r "$_ha_nodes_conf" ]]; then
+    (
+        # nodes.conf is the same trusted local shell configuration the HA daemon
+        # sources. Keep its defaults and quoted-value handling identical.
+        HA_ENABLED=true DHCP_HA=true
+        . "$_ha_nodes_conf" || exit 1
+        if [[ "$HA_ENABLED" == true && "$DHCP_HA" == true ]]; then
+            if [[ "${FTLCONF_dhcp_active:-false}" != false ]]; then
+                echo "pihole-ha-inject: refusing environment-enforced DHCP before HA election" >&2
+                exit 1
+            fi
+            pihole-FTL --config dhcp.active false >/dev/null || exit 1
+        fi
+    ) || { echo "pihole-ha-inject: DHCP boot guard failed; FTL not started" >&2; exit 1; }
+fi
+
 # Run injection in background so Pi-hole starts immediately
 inject_ha &
 
