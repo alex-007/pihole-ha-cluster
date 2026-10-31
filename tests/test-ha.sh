@@ -995,6 +995,24 @@ assert_contains "the dashboard uses the peer's recorded port" \
     "$_dash_src" '${_NODE_PORTS[$ip]:-80}/api/auth'
 
 # ============================================================
+# A node must be able to be told its own address
+# ------------------------------------------------------------
+# Identity is detected from the addresses this process can see. That is the
+# host's on a normal install and the container's on a bridge network — a 172.x
+# that matches no HA_NODES entry, so the daemon exits "Unknown IP" with no way
+# to correct it (Discourse 86667 #151).
+_ip_override() { PIHOLE_HA_LOCAL_IP="$1" bash -c '
+    source "'"$SCRIPT_DIR"'/../pihole-ha-platform"
+    hostname() { [[ "$1" == -I ]] && echo "172.18.0.5"; }
+    ip() { :; }
+    platform_get_local_ip'; }
+assert_eq "an explicit node address is used"      "192.168.1.10" "$(_ip_override 192.168.1.10)"
+assert_eq "a malformed one is ignored, not trusted" "172.18.0.5"  "$(_ip_override 'not-an-ip')"
+assert_eq "unset leaves detection alone"            "172.18.0.5"  "$(_ip_override '')"
+assert_contains "the bridge-network setup is documented" \
+    "$(cat "$SCRIPT_DIR/../docker/README.md")" "PIHOLE_HA_LOCAL_IP"
+
+# ============================================================
 # Taking the VIP must actually be announced on the LAN
 # ------------------------------------------------------------
 # Captured on a live interface, the old `arping -U -c3 -I <iface> <VIP>` put
