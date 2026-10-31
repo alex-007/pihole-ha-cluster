@@ -94,6 +94,13 @@ lease_sync_cycle() {
     lease_sync_member "$owner" || return 1
     lease_sync_due || return 0
     lease_sync_fetch "$owner"
+    local result=$?
+    if (( result == 1 )); then
+        printf '%s\\n' "$owner" > "$LEASE_SYNC_DIR/blocked-owner"
+    elif (( result == 0 )); then
+        rm -f "$LEASE_SYNC_DIR/blocked-owner"
+    fi
+    return "$result"
 }
 
 lease_sync_fetch() {
@@ -221,7 +228,14 @@ lease_sync_prepare() {
     [[ -r "$LEASE_SYNC_DIR/cache" ]] || return 1
     owner="$(sed -n '3p' "$LEASE_SYNC_DIR/cache")"
     if [[ -r "$LEASE_SYNC_DIR/last-owner" ]]; then
-        [[ "$(cat "$LEASE_SYNC_DIR/last-owner")" == "$owner" ]] || return 1
+        if [[ "$(cat "$LEASE_SYNC_DIR/last-owner")" != "$owner" ]]; then
+            # An observed peer can overwrite last-owner during failback even
+            # though no peer snapshot was imported. A verified local snapshot is
+            # safe to reuse only when no failed catch-up was recorded.
+            if [[ "$owner" != "$LOCAL_IP" || -r "$LEASE_SYNC_DIR/blocked-owner" ]]; then
+                return 1
+            fi
+        fi
     fi
     lease_sync_import "$LEASE_SYNC_DIR/cache" "$owner" || return 1
     for ip in "${NODES[@]}"; do

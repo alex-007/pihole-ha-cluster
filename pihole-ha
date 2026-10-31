@@ -745,11 +745,15 @@ release_all_sids() {
 # or yield. Releasing costs at most one poll interval of VIP downtime on a
 # routine restart, which is strictly better than a duplicate address.
 #
-# DHCP is deliberately left alone: dhcp.active lives in pihole.toml and survives
-# this process, so a node that is legitimately the DHCP server must keep serving
-# across a daemon restart rather than dropping the LAN's DHCP for a few seconds.
+# A graceful stop hands back the DHCP owner together with the VIP. Otherwise FTL
+# keeps advertising DHCP while the DNS VIP disappears, and a standby correctly
+# refuses takeover because it still observes an active primary.
 _shutdown_release() {
     release_all_sids
+    if [[ "${HA_ENABLED:-false}" == true && "$(get_dhcp 2>/dev/null)" == true ]]; then
+        log_info "event=shutdown_release_dhcp reason=\"daemon stopping — releasing DHCP with the VIP\""
+        set_dhcp false
+    fi
     if has_vip; then
         log_info "event=shutdown_release_vip vip=$VIP reason=\"daemon stopping — releasing the VIP so it is never left bound with nothing managing it\""
         remove_vip

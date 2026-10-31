@@ -2510,13 +2510,10 @@ assert_contains "the release is wired to EXIT"      "$_hasrc2" "trap '_shutdown_
 # INT/TERM must EXIT after releasing, not fall back into the loop: that is what
 # left systemd waiting out its stop timeout and SIGKILLing the daemon.
 assert_contains "and INT/TERM exit after releasing"  "$_hasrc2" "trap '_shutdown_once; exit 0' INT TERM"
-# DHCP must NOT be dropped on shutdown: dhcp.active outlives this process, and a
-# node that is legitimately the DHCP server should survive a daemon restart.
-assert_not_contains "shutdown does not disable DHCP" "$_hasrc2" '_shutdown_release() {
-    release_all_sids
-    if has_vip; then
-        log_info'"'"'
-        set_dhcp false'
+# A graceful HA stop must hand back both resources together. Leaving FTL DHCP
+# active after removing the VIP makes the standby correctly refuse takeover while
+# clients lose DNS through the dead VIP.
+assert_contains "shutdown disables DHCP with the VIP" "$_hasrc2" 'set_dhcp false'
 
 # Removed from HA_NODES: the election walked NODES past the end of the array,
 # which under set -u killed the daemon while it held the VIP, and systemd then
