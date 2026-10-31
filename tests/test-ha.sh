@@ -221,6 +221,43 @@ DHCP_MASTER="10.33.47.55"; LOCAL_IP="10.33.47.3"; MY_IDX=1
 should_i_serve >/dev/null 2>&1
 assert_eq "valid pin left untouched" "10.33.47.55" "$DHCP_MASTER"
 
+# ============================================================
+echo
+echo "=== Graceful shutdown ownership release ==="
+
+eval "$(extract_fn "$HA_SRC" _shutdown_release)"
+_shutdown_events="$(mktemp)"
+release_all_sids() { printf 'sids\n' >> "$_shutdown_events"; }
+get_dhcp() { cat "$_shutdown_state"; }
+set_dhcp() { printf '%s\n' "$1" >> "$_shutdown_events"; printf '%s' "$1" > "$_shutdown_state"; }
+has_vip() { [[ -f "$_shutdown_vip" ]]; }
+remove_vip() {
+    printf 'vip\n' >> "$_shutdown_events"
+    rm -f "$_shutdown_vip"
+}
+log_info() { :; }
+HA_ENABLED=true; DHCP_HA=true; VIP=192.0.2.9
+_shutdown_state="$(mktemp)"; _shutdown_vip="$(mktemp)"
+printf true > "$_shutdown_state"
+_shutdown_release
+assert_eq "shutdown disables DHCP before VIP release" $'false\nsids\nvip' "$(cat "$_shutdown_events")"
+assert_eq "shutdown leaves DHCP disabled" false "$(cat "$_shutdown_state")"
+
+: > "$_shutdown_events"; printf true > "$_shutdown_state"; : > "$_shutdown_vip"
+set_dhcp() { printf 'set_dhcp\n' >> "$_shutdown_events"; return 1; }
+_shutdown_release
+assert_eq "failed DHCP handoff does not remove VIP" $'set_dhcp' "$(cat "$_shutdown_events")"
+assert_true "failed DHCP handoff keeps VIP" test -f "$_shutdown_vip"
+
+set_dhcp() { printf 'unexpected-set-dhcp\n' >> "$_shutdown_events"; return 1; }
+for _mode in "HA_ENABLED=false" "DHCP_HA=false"; do
+    eval "$_mode"; : > "$_shutdown_events"; printf true > "$_shutdown_state"; : > "$_shutdown_vip"
+    _shutdown_release
+    assert_eq "$_mode leaves DHCP untouched" $'sids\nvip' "$(cat "$_shutdown_events")"
+    assert_eq "$_mode leaves DHCP enabled" true "$(cat "$_shutdown_state")"
+done
+rm -f "$_shutdown_events" "$_shutdown_state" "$_shutdown_vip"
+
 DHCP_MASTER="auto"; LOCAL_IP="10.33.47.3"; MY_IDX=1
 assert_false "auto: standby yields while P1 healthy" should_i_serve
 peer_dhcp["10.33.47.55"]="false"
@@ -2676,13 +2713,10 @@ assert_contains "the release is wired to EXIT"      "$_hasrc2" "trap '_shutdown_
 # INT/TERM must EXIT after releasing, not fall back into the loop: that is what
 # left systemd waiting out its stop timeout and SIGKILLing the daemon.
 assert_contains "and INT/TERM exit after releasing"  "$_hasrc2" "trap '_shutdown_once; exit 0' INT TERM"
-# DHCP must NOT be dropped on shutdown: dhcp.active outlives this process, and a
-# node that is legitimately the DHCP server should survive a daemon restart.
-assert_not_contains "shutdown does not disable DHCP" "$_hasrc2" '_shutdown_release() {
-    release_all_sids
-    if has_vip; then
-        log_info'"'"'
-        set_dhcp false'
+# A graceful HA stop must hand back both resources together. Leaving FTL DHCP
+# active after removing the VIP makes the standby correctly refuse takeover while
+# clients lose DNS through the dead VIP.
+assert_contains "shutdown disables DHCP with the VIP" "$_hasrc2" 'set_dhcp false'
 
 # Removed from HA_NODES: the election walked NODES past the end of the array,
 # which under set -u killed the daemon while it held the VIP, and systemd then

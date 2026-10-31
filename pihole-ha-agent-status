@@ -1,0 +1,37 @@
+#!/bin/bash
+# Report daemon identity and heartbeat, independently of the HA-enabled setting.
+ha_agent_status_json() {
+    local dir="${HA_STATUS_DIR:-/run/pihole-ha}"
+    local expected="${HA_DAEMON_SCRIPT:-/usr/local/bin/pihole-ha}"
+    local pid="" daemon=false fresh=false state=unknown now age max_age
+    max_age="${HA_HEARTBEAT_MAX_AGE:-90}"
+    [[ "$max_age" =~ ^[0-9]+$ ]] || max_age=90
+    if [[ -r "$dir/daemon.pid" ]]; then
+        read -r pid < "$dir/daemon.pid" || true
+        if [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/cmdline" ]]; then
+            local -a argv=()
+            mapfile -d '' -t argv < "/proc/$pid/cmdline"
+            # Match script identity and optional daemon mode, not substrings in
+            # unrelated processes or a reused PID. Docker starts the daemon bare.
+            if [[ "${argv[0]:-}" == "$expected" && ( -z "${argv[1]:-}" || "${argv[1]}" == daemon ) ]]; then
+                daemon=true
+            elif [[ "${argv[0]##*/}" == bash && "${argv[1]:-}" == "$expected" && ( -z "${argv[2]:-}" || "${argv[2]}" == daemon ) ]]; then
+                daemon=true
+            fi
+        fi
+    fi
+    if [[ -r "$dir/status.json" ]]; then
+        now="$(date +%s)"
+        age=$((now - $(stat -c %Y "$dir/status.json" 2>/dev/null || echo 0)))
+        (( age >= 0 && age <= max_age )) && fresh=true
+    fi
+    if [[ "$daemon" == true && "$fresh" == true ]]; then
+        state=running
+    elif [[ "$daemon" == false ]]; then
+        state=stopped
+    fi
+    printf '{"state":"%s","daemon":%s,"heartbeat_fresh":%s}\n' "$state" "$daemon" "$fresh"
+}
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    ha_agent_status_json
+fi

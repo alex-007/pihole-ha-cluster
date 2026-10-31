@@ -47,6 +47,7 @@ COPY new-dhcp-device /usr/local/bin/new-dhcp-device
 COPY pihole-ha-oui-update /usr/local/bin/pihole-ha-oui-update
 COPY pihole-ha-cluster-key /usr/local/bin/pihole-ha-cluster-key
 COPY pihole-ha-lease-sync /usr/local/bin/pihole-ha-lease-sync
+COPY pihole-ha-agent-status /usr/local/bin/pihole-ha-agent-status
 RUN chmod 755 /usr/local/bin/pihole-ha* /usr/local/bin/new-dhcp-device /usr/local/lib/pihole-ha/pihole-ha-platform /usr/local/lib/pihole-ha/pihole-ha-cli
 
 

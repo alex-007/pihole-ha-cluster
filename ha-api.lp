@@ -124,6 +124,31 @@ if action == "status" then
     local content = read_file("/run/pihole-ha/status.json")
     mg.write(content or '{"error":"no status file"}')
 
+elseif action == "agent-status" then
+    local target = get_param("ip")
+    local allowed = false
+    for _, node in ipairs(read_nodes_conf()) do
+        if target == node then allowed = true break end
+    end
+    if not allowed or not target:match("^%d+%.%d+%.%d+%.%d+$") then
+        mg.write('{"state":"unknown","reachable":false,"error":"not a cluster node"}')
+    else
+        local current = read_file("/run/pihole-ha/status.json") or ""
+        local local_ip = current:match('"node"%s*:%s*{%s*"ip"%s*:%s*"([^"]+)"')
+        local command
+        if target == local_ip then
+            -- Pi-hole remains alive when its HA sidecar stops. Inspect the shared
+            -- PID namespace directly instead of depending on the stopped :8887 API.
+            command = "if [ -r /pihole-ha-src/pihole-ha-agent-status ]; then bash /pihole-ha-src/pihole-ha-agent-status; elif [ -r /usr/local/bin/pihole-ha-agent-status ]; then bash /usr/local/bin/pihole-ha-agent-status; fi"
+        else
+            command = "curl -fsS --connect-timeout 0.5 --max-time 2 'http://" .. target .. ":8887/api/agent-status'"
+        end
+        local h = io.popen(command .. " 2>/dev/null")
+        local content = h and h:read("*a") or nil
+        if h then h:close() end
+        mg.write((content and #content > 0) and content or '{"state":"unknown","reachable":false}')
+    end
+
 elseif action == "version" then
     local content = curl_local("/api/version")
     mg.write(content or '{"local":"unknown","latest":"","update_available":false}')

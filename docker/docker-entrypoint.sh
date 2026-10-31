@@ -30,6 +30,7 @@ if [[ -d /pihole-ha-src ]]; then
     # install showed "Pi-hole HA vunknown".
     _stage VERSION
     cp /usr/local/bin/pihole-ha-inject-docker.sh /pihole-ha-src/ 2>/dev/null || true
+    cp /usr/local/bin/pihole-ha-agent-status /pihole-ha-src/ 2>/dev/null || true
     chmod 755 /pihole-ha-src/pihole-ha-inject-docker.sh 2>/dev/null || true
     # Stage the DHCP-event hook where the pihole container can exec it (dnsmasq,
     # which runs in that container, calls it via dhcp-script — see step 5b).

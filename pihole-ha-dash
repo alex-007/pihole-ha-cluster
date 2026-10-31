@@ -4,6 +4,9 @@
 
 PORT=8887
 STATUS_FILE="/run/pihole-ha/status.json"
+for _p in /usr/local/bin/pihole-ha-agent-status /usr/local/lib/pihole-ha/pihole-ha-agent-status ./pihole-ha-agent-status; do
+    [[ -f "$_p" ]] && { . "$_p"; break; }
+done
 VERSION_FILE="/usr/local/share/pihole-ha/VERSION"
 # Raw URL of the VERSION file used for the "update available" check. Empty
 # disables the online check (the panel then just shows the installed version, no
@@ -348,6 +351,10 @@ if [[ "${1:-}" == "--handle" ]]; then
         /api/status)
             send_headers "200 OK" "application/json"
             cat "$STATUS_FILE" 2>/dev/null || echo '{"error":"no status file"}'
+            ;;
+        /api/agent-status)
+            send_headers "200 OK" "application/json"
+            ha_agent_status_json
             ;;
         /api/version)
             # Installed version, plus the latest upstream version if the online

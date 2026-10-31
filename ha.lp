@@ -262,6 +262,7 @@ local col_class = node_count == 2 and "col-lg-6 col-md-6" or "col-lg-4 col-md-4"
             <div class="inner">
                 <p><?=role?> (<?=short?>)</p>
                 <h3 id="node-status-<?=idx?>">---</h3>
+                <p id="node-agent-<?=idx?>" data-agent-status="<?=node_ip?>" style="margin:0;font-size:12px">HA agent: Unknown</p>
                 <p id="node-stats-<?=idx?>" style="margin:0;font-size:13px">&nbsp;</p>
             </div>
             <div class="icon">
