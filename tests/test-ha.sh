@@ -673,6 +673,7 @@ assert_not_contains "a missing dns-cnames.json is not a fatal payload error" \
 # The applier itself, run against the real implementation.
 _json_is_empty() { local s="${1//[[:space:]]/}"; [[ -z "$s" || "$s" == "[]" ]]; }
 eval "$(extract_fn "$_pull" apply_array_key)"
+eval "$(extract_fn "$_pull" _array_is_current)"
 eval "$(extract_fn "$_sync" ftl_to_json)"
 
 # FTL's real display output for two CNAME records, and for conditional
@@ -761,7 +762,8 @@ assert_contains "docker reload verifies FTL is still alive" "$_docker_branch" "k
 # SIGHUP is not sufficient.
 _remove_vip_fn="$(extract_fn "$SCRIPT_DIR/../pihole-ha" remove_vip)"
 assert_contains "VIP removal refreshes FTL after address withdrawal" "$_remove_vip_fn" "platform_ftl_restart_dns"
-assert_contains "VIP refresh happens after ip address deletion" "$_remove_vip_fn" 'ip addr del "$VIP/32" dev "$IFACE"'
+assert_contains "VIP removal uses the observed prefix" "$_remove_vip_fn" 'ip addr del "$VIP/$plen" dev "$IFACE"'
+assert_contains "VIP refresh happens after ip address deletion" "${_remove_vip_fn%%platform_ftl_restart_dns*}" 'ip addr del "$VIP/$plen" dev "$IFACE"'
 assert_contains "Docker DNS refresh uses native restartdns action" \
     "$(cat "$_plat")" "action/restartdns"
 
@@ -1173,7 +1175,7 @@ assert_eq "without dig we do not block the handover" "SERVING" "$(_answers_probe
 _port_probe() { bash -c '
     source "'"$SCRIPT_DIR"'/../pihole-ha-platform"
     log_warn() { echo "WARN $*"; }
-    sane_port "$1" "${2:-80}"' _ "$1" "${2:-}"; }
+    sane_port "$1" "${2:-80}"' _ "$1" "${2:-}" 2>&1; }
 assert_contains "a plain port is used as-is"      "$(_port_probe 8080)" "8080"
 assert_not_contains "and says nothing about it"   "$(_port_probe 8080)" "WARN"
 assert_contains "a trailing comment is trimmed"   "$(_port_probe '80   # the host port')" "80"
@@ -1315,6 +1317,7 @@ assert_eq "an unknown interface reads as owned" "OWNED" \
 assert_eq "no arping at all reads as owned" "OWNED" \
     "$(bash -c '
         VIP=10.0.0.9; IFACE=eth0
+        command() { if [[ "$1" == "-v" && "$2" == "arping" ]]; then return 1; fi; builtin command "$@"; }
         '"$(extract_fn "$SCRIPT_DIR/../pihole-ha" vip_is_answered)"'
         vip_is_answered && echo OWNED || echo UNOWNED')"
 assert_contains "claiming a stranded VIP needs several silent checks" \
@@ -1351,6 +1354,7 @@ _remove_probe() {   # $1 = prefix present on the interface
     P_LOG="$log" P_PLEN="$1" bash -c '
         VIP=192.168.1.100; IFACE=eth0
         log_info() { echo "INFO $*"; }; log_error() { echo "ERROR $*"; }
+        platform_ftl_restart_dns() { :; }
         has_vip() { return 0; }
         vip_prefix() { printf "%s" "$P_PLEN"; }
         ip() { echo "CMD: $*" >> "$P_LOG"; }
@@ -1498,7 +1502,7 @@ assert_contains "a missing arping is called out" \
     "$(bash -c '
         VIP=10.0.0.9; IFACE=eth0
         log_warn() { echo "WARN $*"; }; log_info() { echo "INFO $*"; }
-        command() { [[ "$1" == "-v" && "$2" == "arping" ]] && return 1; builtin command "$@"; }
+        command() { if [[ "$1" == "-v" && "$2" == "arping" ]]; then return 1; fi; builtin command "$@"; }
         '"$(extract_fn "$SCRIPT_DIR/../pihole-ha" announce_vip)"'
         announce_vip')" "arping is not installed"
 assert_contains "taking the VIP triggers the announcement" \

@@ -238,12 +238,12 @@ sane_port() {
     digits="${raw%%[!0-9]*}"
     if [[ -n "$digits" ]] && (( 10#$digits >= 1 && 10#$digits <= 65535 )); then
         [[ "$digits" != "$raw" ]] && command -v log_warn >/dev/null 2>&1 && \
-            log_warn "event=port_trimmed raw=\"$raw\" using=$digits reason=\"everything after the number was ignored — an inline comment in a .env file is the usual cause\""
+            log_warn "event=port_trimmed raw=\"$raw\" using=$digits reason=\"everything after the number was ignored — an inline comment in a .env file is the usual cause\"" >&2
         printf '%s' "$digits"
         return 0
     fi
     command -v log_warn >/dev/null 2>&1 && \
-        log_warn "event=port_invalid raw=\"$raw\" using=$fallback reason=\"not a usable TCP port\""
+        log_warn "event=port_invalid raw=\"$raw\" using=$fallback reason=\"not a usable TCP port\"" >&2
     printf '%s' "$fallback"
 }
 
@@ -516,7 +516,7 @@ platform_set_dhcp() {
     local want="$1"
     command -v pihole-FTL >/dev/null 2>&1 || return 1
     if [[ "$PIHOLE_HA_PLATFORM" == "docker" ]]; then
-        local url="http://127.0.0.1:${PIHOLE_WEB_PORT:-80}/api" pw escaped reply sid rc
+        local url="http://127.0.0.1:$(sane_port "${PIHOLE_WEB_PORT:-80}")/api" pw escaped reply sid rc
         pw="${PIHOLE_PASSWORD:-${PIHOLE_HA_API_PASSWORD:-}}"
         escaped="${pw//\\/\\\\}"; escaped="${escaped//\"/\\\"}"
         reply="$(printf '{"password":"%s"}' "$escaped" | curl -fsS --max-time 8 -H 'Content-Type: application/json' --data-binary @- "$url/auth")" || return 1
@@ -556,13 +556,19 @@ platform_ftl_restart() {
         mapfile -t pids < <(pgrep -x pihole-FTL 2>/dev/null)
         (( ${#pids[@]} )) || return 1
         local pid delivered=false
+        local -a signalled=()
         for pid in "${pids[@]}"; do
-            kill -HUP "$pid" 2>/dev/null && delivered=true
+            if kill -HUP "$pid" 2>/dev/null; then
+                delivered=true
+                signalled+=("$pid")
+            fi
         done
         [[ "$delivered" == "true" ]] || return 1
         sleep 2
         # Still alive? Then the reload landed rather than killing it.
-        kill -0 "${pids[0]}" 2>/dev/null && return 0
+        for pid in "${signalled[@]}"; do
+            kill -0 "$pid" 2>/dev/null && return 0
+        done
         return 1
     else
         systemctl restart pihole-FTL
@@ -573,7 +579,7 @@ platform_ftl_restart() {
 # rebuild dnsmasq's local-interface suppression state after an address move.
 platform_ftl_restart_dns() {
     if [[ "$PIHOLE_HA_PLATFORM" == "docker" ]]; then
-        local url="http://127.0.0.1:${PIHOLE_WEB_PORT:-80}/api" pw escaped reply sid
+        local url="http://127.0.0.1:$(sane_port "${PIHOLE_WEB_PORT:-80}")/api" pw escaped reply sid
         pw="${PIHOLE_PASSWORD:-${PIHOLE_HA_API_PASSWORD:-}}"
         escaped="${pw//\\/\\\\}"; escaped="${escaped//\"/\\\"}"
         reply="$(printf '{"password":"%s"}' "$escaped" | curl -fsS --max-time 8 -H 'Content-Type: application/json' --data-binary @- "$url/auth")" || return 1
