@@ -2,6 +2,39 @@
 
 All notable changes to pihole-ha, newest first. Versions are the `vMAJOR.MINOR.PATCH` release tags in git; the current one drives the "update available" badge in the HA panel.
 
+## v3.19.27 — 2026-11-06
+- Deliver the FTL reload, instead of reporting one that never happened
+
+## v3.19.26 — 2026-11-04
+- Make the stranded-VIP probe interval a knob
+
+## v3.19.25 — 2026-11-04
+- Fix the probe rate limit I got backwards, and warn when two nodes serve DHCP
+
+## v3.19.24 — 2026-11-03
+- Probe for a stranded VIP on its own clock, and hand over only to a node that can serve
+
+## v3.19.23 — 2026-11-03
+- Treat a port as a number, whatever the environment hands over
+
+## v3.19.22 — 2026-11-03
+- Match the docs assertion on text the prose cannot rewrap
+
+## v3.19.21 — 2026-11-03
+- Correct the PID-namespace advice, and document the way out of it
+
+## v3.19.20 — 2026-11-03
+- Keep a stranded VIP until the node we defer to can actually hold it
+
+## v3.19.19 — 2026-11-02
+- Pick up a VIP that nobody is holding
+
+## v3.19.18 — 2026-11-02
+- Stop claiming a VIP another daemon owns, and say what "Unknown IP" compared
+
+## v3.19.17 — 2026-11-01
+- Keep announcing the VIP while holding it
+
 ## v3.19.16 — 2026-10-31
 - Let a node be told its own address, for Pi-hole on a bridge network
 

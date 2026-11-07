@@ -141,6 +141,43 @@ volumes:
 > Config Sync panel — comes from those two read-only mounts on the **Pi-hole**
 > service, not from the sidecar's copies.
 
+### Platforms that restart containers on their own (Synology DSM HA, and similar)
+
+`pid: "service:pihole"` makes the sidecar join the Pi-hole container's process
+namespace, and that join happens every time the sidecar **starts**. If the
+Pi-hole container is not running at that moment, the start fails:
+
+```
+failed to join PID namespace: container <id> is not running
+```
+
+Two things about this are worth knowing, both verified rather than assumed:
+
+- The container is fine. Start it again once Pi-hole is running and it joins
+  normally — nothing has to be recreated. (A genuinely stale reference reads
+  `No such container: <id>` instead, which is a different problem.)
+- **The restart policy will not do it for you.** After a failed join the
+  sidecar sits in `exited` and is never retried, even once Pi-hole is back.
+  `restart: unless-stopped` does not cover this.
+
+`depends_on` orders `docker compose up`, which prevents the race in the normal
+case, and it does not conflict with `pid:`. It has no say over the restart
+policy, so on a platform that fails over by itself — a DSM HA controller
+switchover, for instance — run `docker compose up -d` from a boot task.
+
+**Or sidestep the dependency.** The sidecar needs to see the `pihole-FTL`
+process; the host's namespace contains it too:
+
+```yaml
+    pid: host        # instead of pid: "service:pihole"
+```
+
+There is then no reference to a specific container, so nothing to race and
+nothing to go stale: the sidecar survives the Pi-hole container being
+restarted or recreated underneath it. The trade-off is that it can see every
+process on the host, not just Pi-hole's — it already shares the host's network
+in this setup, so for most people that is the better bargain.
+
 ### Keeping Pi-hole on a bridge network
 
 The sidecar itself must run `network_mode: host`: it identifies this node by

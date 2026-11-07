@@ -62,7 +62,7 @@ declare -A NODE_PORTS
 for _rn in "${_RAW_NODES[@]}"; do
     if [[ "$_rn" == *:* ]]; then
         NODES+=("${_rn%%:*}")
-        NODE_PORTS["${_rn%%:*}"]="${_rn##*:}"
+        NODE_PORTS["${_rn%%:*}"]="$(sane_port "${_rn##*:}")"
     else
         NODES+=("$_rn")
         NODE_PORTS["$_rn"]=80
@@ -125,7 +125,16 @@ MY_IDX=-1
 for (( i=0; i<NODE_COUNT; i++ )); do
     [[ "$LOCAL_IP" == "${NODES[$i]}" ]] && { MY_IDX=$i; break; }
 done
-[[ $MY_IDX -lt 0 ]] && { echo "Unknown IP: $LOCAL_IP" >&2; exit 1; }
+if (( MY_IDX < 0 )); then
+    # "Unknown IP: x.x.x.x" on its own told nobody what it was compared against.
+    # A Docker user hit it with a stale nodes.conf naming a different address
+    # and had no way to see that from the message.
+    echo "ERROR: this node's address ($LOCAL_IP) is not in the cluster node list (HA_NODES=${NODES[*]})." >&2
+    echo "       Either the detected address is wrong — set PIHOLE_HA_LOCAL_IP (Docker) or correct it in $NODES_CONF —" >&2
+    echo "       or the node list is: fix HA_NODES there. On Docker, nodes.conf is only regenerated from the" >&2
+    echo "       environment when PIHOLE_HA_FORCE_CONFIG=true, so a changed PIHOLE_HA_NODES is otherwise ignored." >&2
+    exit 1
+fi
 
 PRIORITY=$((MY_IDX + 1))
 ROLE="${ROLES[$MY_IDX]}"
@@ -278,7 +287,7 @@ reload_vip_conf() {
         for _rn in "${_RAW_NODES[@]}"; do
             if [[ "$_rn" == *:* ]]; then
                 NODES+=("${_rn%%:*}")
-                NODE_PORTS["${_rn%%:*}"]="${_rn##*:}"
+                NODE_PORTS["${_rn%%:*}"]="$(sane_port "${_rn##*:}")"
             else
                 NODES+=("$_rn")
                 NODE_PORTS["$_rn"]=80
@@ -583,7 +592,7 @@ ensure_sid() {
 
 # Override local node's port from env var or FTL query (Docker may differ from nodes.conf)
 if [[ -n "${PIHOLE_WEB_PORT:-}" ]]; then
-    NODE_PORTS["$LOCAL_IP"]="$PIHOLE_WEB_PORT"
+    NODE_PORTS["$LOCAL_IP"]="$(sane_port "$PIHOLE_WEB_PORT")"
 elif _ftl_port="$(pihole-FTL --config webserver.port 2>/dev/null | grep -o '^[0-9]*')" && [[ -n "$_ftl_port" ]]; then
     NODE_PORTS["$LOCAL_IP"]="$_ftl_port"
 fi
@@ -608,6 +617,20 @@ api_url() {
 has_vip() {
     [[ -n "$VIP" && -n "$IFACE" ]] || return 1
     ip -4 addr show dev "$IFACE" 2>/dev/null | grep -qE "inet $VIP/"
+}
+
+# The prefix length the VIP is actually configured with, if it is present.
+#
+# We add it as /32, but has_vip matches any prefix -- so an address put there
+# by something else (keepalived adds its VIPs with the interface's own prefix,
+# /24 typically) reads as "we hold it". Deleting then fails, because
+# `ip addr del` needs the exact prefix: a node logged
+#   vip_remove status=failed error="RTNETLINK answers: Address not available"
+# on shutdown, kept the address, and went on reporting that it held a VIP that
+# another daemon owned (Discourse 86667 #161).
+vip_prefix() {
+    [[ -n "$VIP" && -n "$IFACE" ]] || return 1
+    ip -4 addr show dev "$IFACE" 2>/dev/null | sed -n "s#.*inet $VIP/\([0-9]\{1,3\}\).*#\1#p" | head -1
 }
 
 # Re-detect IFACE if missing (interface may rename after reboot or USB ethernet reattach)
@@ -676,7 +699,17 @@ add_vip() {
         NOTIFY_TAG=vip_claim_failed notify "<b><font color='#e74c3c'>VIP CLAIM FAILED</font></b> <br> $LOCAL_IP: no network interface" &
         return 1
     fi
-    has_vip && return 0
+    if has_vip; then
+        # Already there. If it is not the /32 we would have added, someone else
+        # put it there -- keepalived, a static config, an older release -- and
+        # two managers on one address is worth saying out loud rather than
+        # quietly counting it as ours.
+        local _plen; _plen="$(vip_prefix)"
+        if [[ -n "$_plen" && "$_plen" != "32" ]]; then
+            log_warn "event=vip_foreign ip=$VIP iface=$IFACE prefix=/$_plen reason=\"this address is already configured with a prefix pihole-ha does not use — something else (keepalived?) is probably managing it; running both on one VIP will fight\""
+        fi
+        return 0
+    fi
     local err
     err="$(ip addr add "$VIP/32" dev "$IFACE" 2>&1)" || {
         log_error "event=vip_add status=failed iface=$IFACE error=\"$err\""
@@ -695,13 +728,17 @@ add_vip() {
 
 remove_vip() {
     has_vip || return 0
-    local err
-    err="$(ip addr del "$VIP/32" dev "$IFACE" 2>&1)" || {
-        log_error "event=vip_remove status=failed iface=$IFACE error=\"$err\""
+    # Delete the prefix that is actually there. Hardcoding /32 failed against
+    # an address another daemon had added as /24, which left it bound with this
+    # node still claiming it.
+    local plen err
+    plen="$(vip_prefix)"; plen="${plen:-32}"
+    err="$(ip addr del "$VIP/$plen" dev "$IFACE" 2>&1)" || {
+        log_error "event=vip_remove status=failed iface=$IFACE prefix=/$plen error=\"$err\" note=\"if another daemon manages this address, pihole-ha should not also be configured with it\""
         return 1
     }
     platform_ftl_restart_dns || log_warn "event=dns_refresh status=failed reason=\"could not fully reinitialize FTL after VIP withdrawal\""
-    log_info "event=vip_remove ip=$VIP iface=$IFACE status=ok"
+    log_info "event=vip_remove ip=$VIP iface=$IFACE prefix=/$plen status=ok"
 }
 
 set_dhcp() {
@@ -1184,6 +1221,93 @@ yielded_to() {
 }
 
 # --- DNS-only VIP failover helpers ---
+# Is anyone actually answering for the VIP?
+#
+# A standby yields to any higher-priority node that answers ping and DNS. On a
+# node where Pi-hole is up but the HA daemon is not -- a container that failed
+# to restart, a stopped service -- that test passes and nothing then claims the
+# address: the standby releases it and the "healthy" peer never takes it. A
+# reporter's capture showed minutes of clients broadcasting "who-has <VIP>"
+# with silence (Discourse 86667 #167).
+#
+# Gating the yield on the peer's HA API would risk the opposite fault: a peer
+# whose dash we cannot reach but whose daemon is fine would leave both nodes
+# holding the address. So ask the only question that cannot be wrong -- does
+# anything on the LAN answer for this address -- and reclaim only after several
+# consecutive silences.
+VIP_ORPHAN_AFTER=3
+vip_orphan_count=0
+# The probe is two ARP packets, and running it every cycle put a pair on the
+# wire every few seconds forever -- visible in a reporter's capture as a steady
+# stream of "who-has <VIP>" from the standby, and it also parks the loop for up
+# to two seconds each time. Once per VIP_PROBE_EVERY is enough: three silences
+# still catches a stranded VIP inside a minute.
+# How often a standby that has yielded checks whether anything still answers
+# for the VIP. Two ARP packets each time, so roughly 0.2 packets a second at
+# the default -- which is what makes a stranded VIP visible within about half a
+# minute. Set VIP_PROBE_EVERY in nodes.conf to trade detection speed for quiet;
+# 0 switches the check off entirely, and with it the ability to notice that
+# nobody is holding the address.
+VIP_PROBE_EVERY="${VIP_PROBE_EVERY:-10}"
+[[ "$VIP_PROBE_EVERY" =~ ^[0-9]+$ ]] || VIP_PROBE_EVERY=10
+vip_probe_next=0
+# Set when we took the VIP because nobody was holding it. Until the node we are
+# meant to defer to proves it can actually hold it, giving the address back
+# just strands it again: a reporter saw the VIP answer for 17s and time out for
+# 12s, over and over, which is this exact loop (Discourse 86667).
+vip_claimed_stranded=false
+
+# Is the peer's HA daemon alive, as opposed to its Pi-hole?
+#
+# Deliberately NOT used to decide whether to yield in general -- a peer whose
+# dash we merely cannot reach would then leave both nodes holding the address.
+# It is used only to decide whether to give back a VIP we picked up because it
+# was stranded, where the conservative answer (keep holding) is also the safe
+# one: we are the only holder either way.
+# Does this peer actually answer DNS, as opposed to having port 53 open?
+#
+# The health check is a port probe, which FTL satisfies the moment it binds --
+# before gravity is loaded and before it answers anything. Good enough for
+# "is it alive", wrong for "can I hand it the VIP": a standby released the
+# address to a node that then took another minute to serve, and the VIP was
+# dark in between (Discourse 86667 #178).
+peer_answers_dns() {
+    local ip="$1"
+    command -v dig >/dev/null 2>&1 || return 0   # cannot ask: keep old behaviour
+    dig +short +tries=1 +time="${HEALTH_TIMEOUT:-2}" "@$ip" pi.hole A >/dev/null 2>&1
+}
+
+peer_ha_alive() {
+    local ip="$1" resp ts
+    resp="$(curl -sf --max-time "${HEALTH_TIMEOUT:-2}" "http://${ip}:8887/api/status" 2>/dev/null)" || return 1
+    ts="$(json_str "$resp" timestamp)"
+    [[ -n "$ts" ]] || return 1
+    # The daemon rewrites status every cycle, so a stale file means it stopped.
+    local now_s age_s
+    now_s="$(date -u +%s)"
+    age_s="$(( now_s - $(date -u -d "$ts" +%s 2>/dev/null || echo 0) ))"
+    (( age_s >= 0 && age_s <= (CHECK_INTERVAL * 3 + 30) ))
+}
+vip_is_answered() {
+    # No way to ask: assume it is owned, which is the conservative answer.
+    command -v arping >/dev/null 2>&1 || return 0
+    [[ -n "$IFACE" && -n "$VIP" ]] || return 0
+    local out
+    out="$(arping -c 2 -w 2 -I "$IFACE" "$VIP" 2>&1)"
+    # Exit status alone is not safe here. arping without a raw socket, or
+    # pointed at an interface that does not exist, also "fails" -- and reading
+    # that as "nobody owns the VIP" would have a standby claim an address
+    # another node is holding. Caught exactly that way in testing: as an
+    # unprivileged user every probe came back silent, including the gateway's.
+    # So only a probe that demonstrably RAN may report an unanswered address.
+    case "$out" in
+        *"packets transmitted"*)                       # Habets arping
+            [[ "$out" == *" 0 packets received"* ]] && return 1 ;;
+        *"probes"*|*"response(s)"*)                     # iputils arping
+            [[ "$out" == *"Received 0 response(s)"* ]] && return 1 ;;
+    esac
+    return 0
+}
 # Health for DNS failover deliberately excludes the Pi-hole API and DHCP: all we
 # need to know is whether the node can answer DNS (port 53). Requiring the API
 # would let a password-locked peer look "down" and trigger a false takeover.
@@ -1325,12 +1449,65 @@ dns_only_vip_cycle() {
         activate_count=0
         if ! has_vip; then
             deactivate_count=0
+            # We yielded to a higher-priority node. Check it actually took the
+            # address: if nobody answers for it over several cycles, the node we
+            # deferred to cannot claim it and the VIP is stranded.
+            # The clock has to advance when we PROBE, not when the probe comes
+            # back unanswered -- putting it inside that branch meant the normal
+            # case (someone holds the VIP) never moved it, so the standby kept
+            # probing every cycle. A reporter watched it do exactly that after
+            # the rate limit supposedly landed.
+            if (( VIP_PROBE_EVERY > 0 )) && is_dns_healthy "$LOCAL_IP" && (( EPOCHSECONDS >= vip_probe_next )); then
+                vip_probe_next=$(( EPOCHSECONDS + VIP_PROBE_EVERY ))
+                if vip_is_answered; then
+                    vip_orphan_count=0
+                    write_status "DNS-only - standby"
+                    return
+                fi
+                (( vip_orphan_count++ )) || true
+                if (( vip_orphan_count >= VIP_ORPHAN_AFTER )); then
+                    log_warn "event=vip_orphaned ip=$VIP checks=$vip_orphan_count reason=\"a higher-priority node answers DNS but nothing answers for the VIP — claiming it so the address is served\""
+                    vip_claimed_stranded=true
+                    add_vip && notify "<b><font color='#f39c12'>$ROLE CLAIMED STRANDED VIP</font></b> <br> <font color='#95a5a6'>$LOCAL_IP</font> took <b>$VIP</b>: nobody was answering for it" &
+                    vip_orphan_count=0
+                    write_status "DNS-only - holding VIP $VIP (claimed, nobody held it)"
+                    return
+                fi
+                write_status "DNS-only - standby (VIP unanswered $vip_orphan_count/$VIP_ORPHAN_AFTER)"
+                return
+            fi
+            # Between probes: say nothing new and, crucially, leave the counter
+            # alone -- resetting it here would mean three consecutive silences
+            # could never accumulate.
             write_status "DNS-only - standby"
             return
+        fi
+        # We hold a VIP we picked up because it was stranded. Handing it back to
+        # a node that answers DNS but whose HA daemon is not running simply
+        # strands it again, and the address flaps between answering and silent.
+        # Keep it until that node can actually take it.
+        if [[ "$vip_claimed_stranded" == "true" ]]; then
+            local _heir="" _i
+            for (( _i=0; _i<MY_IDX; _i++ )); do
+                is_dns_healthy "${NODES[$_i]}" && { _heir="${NODES[$_i]}"; break; }
+            done
+            if [[ -n "$_heir" ]] && ! peer_ha_alive "$_heir"; then
+                deactivate_count=0
+                write_status "DNS-only - holding VIP $VIP ($_heir answers DNS but its HA daemon is not running)"
+                return
+            fi
+            # Its daemon is back. Hand over only once it can answer a query --
+            # port 53 opens well before FTL has loaded gravity.
+            if [[ -n "$_heir" ]] && ! peer_answers_dns "$_heir"; then
+                deactivate_count=0
+                write_status "DNS-only - holding VIP $VIP ($_heir is starting up, not answering queries yet)"
+                return
+            fi
         fi
         (( deactivate_count++ )) || true
         if (( deactivate_count >= DEACTIVATE_AFTER )); then
             log_info "event=vip_release mode=dns-only"
+            vip_claimed_stranded=false
             remove_vip
             notify "<b><font color='#f39c12'>$ROLE DNS VIP RELEASED</font></b> <br> <font color='#95a5a6'>$LOCAL_IP</font> released VIP <b>$VIP</b>, yielding to higher-priority node" &
             deactivate_count=0
@@ -1623,6 +1800,60 @@ update_blocking_state() {
     return 0
 }
 
+# Re-announce the VIP while we hold it.
+#
+# A takeover announces once. If that burst is lost, filtered, or ignored --
+# switches rate-limit ARP, and a client that was mid-conversation with the
+# previous holder may keep its entry -- the LAN does not find out until the
+# entry ages out, which is minutes. A reporter saw exactly that: clients
+# broadcasting "who-has <VIP>" for six minutes with nothing answering, then
+# everything recovering the moment another takeover sent a fresh burst.
+# keepalived re-announces for the same reason. Three packets a minute.
+VIP_ANNOUNCE_EVERY=60
+VIP_ANNOUNCE_NEXT=0
+reannounce_vip() {
+    [[ "$VIP_ENABLED" == "true" ]] || return 0
+    has_vip || { VIP_ANNOUNCE_NEXT=0; return 0; }
+    local now="$EPOCHSECONDS"
+    (( now < VIP_ANNOUNCE_NEXT )) && return 0
+    VIP_ANNOUNCE_NEXT=$(( now + VIP_ANNOUNCE_EVERY ))
+    # Quietly: the claim already logged, and a line a minute is noise.
+    announce_vip >/dev/null 2>&1 &
+    return 0
+}
+
+# Two nodes serving DHCP at once.
+#
+# pihole-ha enables DHCP on exactly one node and disables it on the rest, so
+# this should not happen -- but it does if someone switches it on by hand in
+# each Pi-hole, or brings a node up with dhcp.active already true before the
+# daemon has evaluated anything. The symptom is miserable to diagnose from the
+# client side: leases from two servers, clients with addresses but no working
+# gateway or DNS. A user lost an evening to it ("wifi but no internet") before
+# turning the whole thing off.
+#
+# We cannot safely switch the other node off from here -- that decision is the
+# election's -- but saying it out loud costs nothing.
+dhcp_conflict_warned=false
+warn_if_dhcp_conflict() {
+    [[ "$DHCP_HA" == "true" ]] || return 0
+    [[ "${peer_dhcp[$LOCAL_IP]:-}" == "true" ]] || { dhcp_conflict_warned=false; return 0; }
+    local ip others=""
+    for ip in "${NODES[@]}"; do
+        [[ "$ip" == "$LOCAL_IP" ]] && continue
+        [[ "${peer_dhcp[$ip]:-}" == "true" ]] && others+="${others:+, }$ip"
+    done
+    if [[ -z "$others" ]]; then
+        dhcp_conflict_warned=false
+        return 0
+    fi
+    [[ "$dhcp_conflict_warned" == "true" ]] && return 0
+    dhcp_conflict_warned=true
+    log_warn "event=dhcp_conflict others=\"$others\" reason=\"this node is serving DHCP and so is another — clients will take leases from both and may end up with the wrong gateway or DNS; pihole-ha enables DHCP on one node only, so turn it off in Pi-hole on the others and let failover manage it\""
+    NOTIFY_TAG=dhcp_conflict notify "<b><font color='#dd4b39'>Two DHCP Servers</font></b> <br> $ROLE ($LOCAL_IP) is serving DHCP and so is: $others <br> Turn it off in Pi-hole on the others and let failover manage it" &
+    return 0
+}
+
 # --- Main Loop ---
 log_info "event=startup ip=$LOCAL_IP priority=$PRIORITY interval=${CHECK_INTERVAL}s activate_after=$ACTIVATE_AFTER deactivate_after=$DEACTIVATE_AFTER"
 log_info "event=startup checks=\"ping dns:53 api dhcp\""
@@ -1657,6 +1888,8 @@ while true; do
     # renewal, NetworkManager. Cheap: returns immediately once it is already
     # pinned, which is the steady state.
     enforce_dns_pin
+    warn_if_dhcp_conflict     # two nodes handing out leases is worth saying
+    reannounce_vip            # keep the LAN's ARP entry for the VIP fresh
     update_blocking_state     # does this node still actually block anything?
     reconcile_node_order      # adopt a newer priority order a peer holds
     if reload_vip_conf; then  # only update DNS option when VIP config actually changes
