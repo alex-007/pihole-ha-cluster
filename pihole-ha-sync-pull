@@ -60,6 +60,7 @@ if [[ "$SYNC_BLOB_DIR" != /* ]] || ! mkdir -p "$SYNC_BLOB_DIR" 2>/dev/null || [[
 fi
 SYNC_DIR="/run/pihole-ha"
 LAST_HASH_FILE="$SYNC_DIR/last-pull-hash"
+FTL_RELOAD_PENDING="/etc/pihole-ha/ftl-reload-pending"
 # When this node last completed a check against the publisher, and what came of
 # it. Every successful outcome records it -- including "already up to date",
 # which is the steady state: a timestamp that only moves when the config
@@ -70,6 +71,18 @@ STAGING_DIR="$SYNC_BLOB_DIR/staging-pull"
 SYNC_CONF="/etc/pihole-ha/sync.conf"
 
 mkdir -p "$SYNC_DIR" "$SYNC_BLOB_DIR"
+
+# Persist reload debt: after an atomic database swap the next pull sees the
+# same file checksum, so re-pulling alone would never retry a failed reload.
+reload_ftl_for_sync() {
+    : > "$FTL_RELOAD_PENDING" || return 1
+    platform_ftl_restart || return 1
+    rm -f "$FTL_RELOAD_PENDING"
+}
+if [[ -f "$FTL_RELOAD_PENDING" ]] && ! reload_ftl_for_sync; then
+    log_error "event=ftl_reload status=failed reason=\"pending reload could not be delivered — will retry next cycle\""
+    exit 1
+fi
 
 # Determine this node's index and role
 MY_IDX=-1
@@ -594,9 +607,17 @@ if [[ "$COMP_GRAVITY" == "true" && -f "$STAGING_DIR/gravity.db" ]]; then
             sync /etc/pihole/gravity.db.tmp 2>/dev/null || true
             chown pihole:pihole /etc/pihole/gravity.db.tmp 2>/dev/null || true
             if mv -f /etc/pihole/gravity.db.tmp /etc/pihole/gravity.db; then
-                platform_ftl_restart
-                GRAVITY_RESTARTED=true
-                log_info "event=apply component=gravity status=ok ftl=restarted"
+                # FTL holds gravity.db open, so a swapped file is invisible to
+                # it until it reopens. If telling it fails, the node is serving
+                # the old blocklist and must say so rather than report success.
+                if reload_ftl_for_sync; then
+                    GRAVITY_RESTARTED=true
+                    log_info "event=apply component=gravity status=ok ftl=restarted"
+                else
+                    GRAVITY_RESTARTED=false
+                    APPLY_FAILED=true
+                    log_error "event=apply component=gravity status=stale reason=\"the new blocklist is on disk but FTL could not be told to reload it — it is still serving the previous one; restarting pihole-FTL (or the container) will pick it up\""
+                fi
                 APPLIED_SOMETHING=true
             else
                 log_error "event=apply component=gravity status=failed reason=\"could not replace gravity.db\""
@@ -639,8 +660,12 @@ apply_array_key true dns.upstreams dns-upstreams.json dns_upstreams
 # settings are applied AFTER that restart, so a fresh restart is still
 # needed to pick them up.
 if [[ "$SETTINGS_APPLIED" == "true" || "$HOSTS_APPLIED" == "true" ]]; then
-    platform_ftl_restart
-    log_info "event=ftl_restart reason=\"settings/hosts applied\""
+    if reload_ftl_for_sync; then
+        log_info "event=ftl_restart reason=\"settings/hosts applied\""
+    else
+        APPLY_FAILED=true
+        log_error "event=ftl_restart status=failed reason=\"settings/hosts applied but FTL could not be told to reload — will retry next cycle\""
+    fi
 fi
 
 # Cleanup

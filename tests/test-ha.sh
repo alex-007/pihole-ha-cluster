@@ -673,6 +673,7 @@ assert_not_contains "a missing dns-cnames.json is not a fatal payload error" \
 # The applier itself, run against the real implementation.
 _json_is_empty() { local s="${1//[[:space:]]/}"; [[ -z "$s" || "$s" == "[]" ]]; }
 eval "$(extract_fn "$_pull" apply_array_key)"
+eval "$(extract_fn "$_pull" _array_is_current)"
 eval "$(extract_fn "$_sync" ftl_to_json)"
 
 # FTL's real display output for two CNAME records, and for conditional
@@ -761,7 +762,8 @@ assert_contains "docker reload verifies FTL is still alive" "$_docker_branch" "k
 # SIGHUP is not sufficient.
 _remove_vip_fn="$(extract_fn "$SCRIPT_DIR/../pihole-ha" remove_vip)"
 assert_contains "VIP removal refreshes FTL after address withdrawal" "$_remove_vip_fn" "platform_ftl_restart_dns"
-assert_contains "VIP refresh happens after ip address deletion" "$_remove_vip_fn" 'ip addr del "$VIP/32" dev "$IFACE"'
+assert_contains "VIP removal uses the observed prefix" "$_remove_vip_fn" 'ip addr del "$VIP/$plen" dev "$IFACE"'
+assert_contains "VIP refresh happens after ip address deletion" "${_remove_vip_fn%%platform_ftl_restart_dns*}" 'ip addr del "$VIP/$plen" dev "$IFACE"'
 assert_contains "Docker DNS refresh uses native restartdns action" \
     "$(cat "$_plat")" "action/restartdns"
 
@@ -1041,6 +1043,388 @@ assert_contains "the dashboard uses the peer's recorded port" \
     "$_dash_src" '${_NODE_PORTS[$ip]:-80}/api/auth'
 
 # ============================================================
+# Telling FTL to reload has to actually reach it
+# ------------------------------------------------------------
+# On a live node `pgrep -x pihole-FTL` returns TWO pids. The Docker reload
+# collected them into one string and passed that to kill, which rejects it, so
+# the signal was never delivered -- while the caller logged "ftl=restarted".
+# A standby swapped gravity.db underneath an FTL that kept serving the old one
+# (it holds the file open), and the panel showed stale domain and list counts
+# until the container was restarted by hand (Discourse 86667 #189). Confirmed
+# against a live FTL: the old code returns failure and FTL's reload count does
+# not move; the fixed one moves it.
+_reload_probe() {   # $1 = pids pgrep reports, $2 = pids kill accepts
+    local log; log="$(mktemp)"
+    P_PIDS="$1" P_OK="$2" P_LOG="$log" bash -c '
+        PIHOLE_HA_PLATFORM=docker
+        pgrep() { [[ -n "$P_PIDS" ]] && printf "%s\n" $P_PIDS; }
+        kill() {
+            [[ "$1" == "-0" ]] && return 0
+            local target="${*: -1}"
+            echo "SIGNALLED $target" >> "$P_LOG"
+            [[ " $P_OK " == *" $target "* ]]
+        }
+        sleep() { :; }
+        '"$(extract_fn "$SCRIPT_DIR/../pihole-ha-platform" platform_ftl_restart)"'
+        platform_ftl_restart && echo RELOADED || echo FAILED
+    '
+    cat "$log" 2>/dev/null; rm -f "$log"
+}
+assert_contains "both FTL processes are signalled" "$(_reload_probe "1968043 1968051" "1968043 1968051")" "SIGNALLED 1968051"
+assert_contains "and the first one too"            "$(_reload_probe "1968043 1968051" "1968043 1968051")" "SIGNALLED 1968043"
+assert_contains "two pids is a success, not a failure" "$(_reload_probe "1968043 1968051" "1968043 1968051")" "RELOADED"
+assert_contains "a single pid still works"         "$(_reload_probe "194" "194")" "RELOADED"
+assert_contains "no FTL at all is a failure"       "$(_reload_probe "" "")" "FAILED"
+# One of them going away between pgrep and kill is normal, not a failure.
+assert_contains "one deliverable signal is enough" "$(_reload_probe "100 101" "101")" "RELOADED"
+assert_contains "none deliverable is a failure"    "$(_reload_probe "100 101" "")" "FAILED"
+# And a reload that did not happen must not be reported as success.
+_pull_reload="$(cat "$SCRIPT_DIR/../pihole-ha-sync-pull")"
+assert_contains "a failed reload is reported"      "$_pull_reload" "status=stale"
+assert_contains "and says what the node is serving" "$_pull_reload" "still serving the previous one"
+assert_contains "and the pull is marked failed so it retries" "$_pull_reload" 'APPLY_FAILED=true'
+
+# ============================================================
+# Two nodes serving DHCP must be said out loud
+# ------------------------------------------------------------
+# pihole-ha enables DHCP on one node and disables it on the rest, but a user
+# who switched it on by hand in every Pi-hole got leases from all of them —
+# clients with addresses and no working gateway, which is miserable to
+# diagnose from the client end (Discourse 86667 #180).
+_conflict_probe() {   # $1 = our dhcp state, $2.. = peers' states
+    P_SELF="$1" P_A="${2:-false}" P_B="${3:-false}" bash -c '
+        DHCP_HA=true; LOCAL_IP=10.0.0.1; ROLE=PRIMARY
+        NODES=(10.0.0.1 10.0.0.2 10.0.0.3)
+        declare -A peer_dhcp
+        peer_dhcp[10.0.0.1]="$P_SELF"; peer_dhcp[10.0.0.2]="$P_A"; peer_dhcp[10.0.0.3]="$P_B"
+        dhcp_conflict_warned=false
+        log_warn() { echo "WARN $*"; }; notify() { :; }
+        '"$(extract_fn "$SCRIPT_DIR/../pihole-ha" warn_if_dhcp_conflict)"'
+        warn_if_dhcp_conflict
+        warn_if_dhcp_conflict      # second call: must not repeat
+    '
+}
+assert_contains "two servers at once is reported"   "$(_conflict_probe true true)" "event=dhcp_conflict"
+assert_contains "and the other node is named"       "$(_conflict_probe true true)" "10.0.0.2"
+assert_contains "both others are named"             "$(_conflict_probe true true true)" "10.0.0.3"
+assert_eq "it is said once, not every cycle" "1" \
+    "$(_conflict_probe true true | grep -c 'event=dhcp_conflict')"
+assert_eq "one server is normal and silent"  ""  "$(_conflict_probe true false false)"
+assert_eq "a standby with none is silent"    ""  "$(_conflict_probe false true false)"
+assert_contains "the tag is registered for muting" \
+    "$(cat "$SCRIPT_DIR/../pihole-ha-dash")" "dhcp_conflict"
+
+# ============================================================
+# Hand the VIP over when the heir can serve, and stop ARPing every cycle
+# ------------------------------------------------------------
+# Two things a reporter saw after the previous fixes (Discourse 86667 #178):
+# a steady stream of "who-has <VIP>" from the standby, which was the orphan
+# probe running every cycle; and the VIP dark for a minute after a switchover,
+# because the standby released it to a node whose port 53 was open while FTL
+# was still loading gravity.
+# The cadence is a trade between ARP noise and how fast a stranded VIP is
+# noticed, so it is a knob rather than a constant — and 0 turns the check off
+# for anyone who would rather have silence.
+_hasrc_probe="$(cat "$SCRIPT_DIR/../pihole-ha")"
+assert_contains "the probe interval can be set in nodes.conf" "$_hasrc_probe" 'VIP_PROBE_EVERY:-10'
+assert_contains "a junk value falls back to the default"      "$_hasrc_probe" 'VIP_PROBE_EVERY=10'
+assert_contains "zero disables the probe entirely" \
+    "$(extract_fn "$SCRIPT_DIR/../pihole-ha" dns_only_vip_cycle)" '(( VIP_PROBE_EVERY > 0 ))'
+assert_contains "and it is documented" \
+    "$(cat "$SCRIPT_DIR/../README.md")" "VIP_PROBE_EVERY"
+
+assert_contains "the stranded-VIP probe has its own slower clock" \
+    "$(cat "$SCRIPT_DIR/../pihole-ha")" "VIP_PROBE_EVERY"
+assert_contains "and the cycle respects it" \
+    "$(extract_fn "$SCRIPT_DIR/../pihole-ha" dns_only_vip_cycle)" 'EPOCHSECONDS >= vip_probe_next'
+# The clock must advance when a probe RUNS. Advancing it only when the probe
+# came back unanswered left the normal case probing every cycle, which is what
+# the reporter was still seeing after the rate limit "landed".
+_cycle_src="$(extract_fn "$SCRIPT_DIR/../pihole-ha" dns_only_vip_cycle)"
+_probe_block="${_cycle_src#*EPOCHSECONDS >= vip_probe_next}"
+assert_contains "the clock advances before the result is examined" \
+    "${_probe_block%%vip_is_answered*}" "vip_probe_next=\$(( EPOCHSECONDS + VIP_PROBE_EVERY ))"
+
+_answers_probe() {   # $1 = dig exit code, "nodig" for no dig at all
+    P_RC="$1" bash -c '
+        HEALTH_TIMEOUT=1
+        if [[ "$P_RC" != nodig ]]; then
+            dig() { return "$P_RC"; }
+            command() { [[ "$1" == "-v" && "$2" == "dig" ]] && return 0; builtin command "$@"; }
+        else
+            command() { [[ "$1" == "-v" && "$2" == "dig" ]] && return 1; builtin command "$@"; }
+        fi
+        '"$(extract_fn "$SCRIPT_DIR/../pihole-ha" peer_answers_dns)"'
+        peer_answers_dns 10.0.0.2 && echo SERVING || echo NOT_YET
+    '
+}
+assert_eq "a peer that replies is ready"            "SERVING" "$(_answers_probe 0)"
+assert_eq "a peer that does not reply is not"       "NOT_YET" "$(_answers_probe 9)"
+# No dig: fall back to the old behaviour rather than never handing over.
+assert_eq "without dig we do not block the handover" "SERVING" "$(_answers_probe nodig)"
+
+
+# ============================================================
+# A port is a number, whatever the environment hands us
+# ------------------------------------------------------------
+# A user's status JSON came back saying:
+#   "this node's own Pi-hole API on port 80    # The HOST port for Pi-hole
+#    webgui did not answer"
+# His PIHOLE_WEB_PORT carried an inline comment from a .env file, and the whole
+# string went into a URL (Discourse 86667 #175).
+_port_probe() { bash -c '
+    source "'"$SCRIPT_DIR"'/../pihole-ha-platform"
+    log_warn() { echo "WARN $*"; }
+    sane_port "$1" "${2:-80}"' _ "$1" "${2:-}" 2>&1; }
+assert_contains "a plain port is used as-is"      "$(_port_probe 8080)" "8080"
+assert_not_contains "and says nothing about it"   "$(_port_probe 8080)" "WARN"
+assert_contains "a trailing comment is trimmed"   "$(_port_probe '80   # the host port')" "80"
+assert_contains "and the trimming is reported"    "$(_port_probe '80   # the host port')" "event=port_trimmed"
+assert_contains "something that is not a port falls back" "$(_port_probe 'notaport')" "80"
+assert_contains "and is reported"                 "$(_port_probe 'notaport')" "event=port_invalid"
+assert_contains "so does a number out of range"   "$(_port_probe 99999)" "event=port_invalid"
+assert_contains "an empty value falls back too"   "$(_port_probe '')" "80"
+# Every place a port is taken has to go through it, or the next one leaks.
+_ha_ports="$(cat "$SCRIPT_DIR/../pihole-ha")"
+assert_not_contains "the node list parse does not take a port raw" \
+    "$_ha_ports" 'NODE_PORTS["${_rn%%:*}"]="${_rn##*:}"'
+assert_not_contains "nor does the environment override" \
+    "$_ha_ports" 'NODE_PORTS["$LOCAL_IP"]="$PIHOLE_WEB_PORT"'
+assert_eq "all three sites validate" "3" "$(grep -c 'sane_port' <<< "$_ha_ports")"
+
+# ============================================================
+# The PID-namespace dependency has to be documented, including its escape
+# ------------------------------------------------------------
+# "failed to join PID namespace: container <id> is not running" means the
+# target exists but was not running at that instant -- a race, not a stale
+# reference, which reads "No such container" instead. Reproduced both, plus the
+# part that actually bites: after a failed join the sidecar stays exited and
+# the restart policy never retries it (Discourse 86667 #174).
+_docker_readme="$(cat "$SCRIPT_DIR/../docker/README.md")"
+assert_contains "the join failure is explained"          "$_docker_readme" "failed to join PID namespace"
+assert_contains "and that the restart policy will not fix it" \
+    "$_docker_readme" "restart policy will not do it for you"
+assert_contains "and that nothing needs recreating"      "$_docker_readme" "nothing has to be recreated"
+assert_contains "pid: host is offered as the way out"    "$_docker_readme" "pid: host"
+# Matched on a fragment the prose cannot line-wrap away.
+assert_contains "with its trade-off stated"              "$_docker_readme" "process on the host, not just"
+# Ordering still belongs in the compose we generate.
+assert_contains "the generated compose orders the sidecar after Pi-hole" \
+    "$(cat "$SCRIPT_DIR/../docker/docker-compose.yml")" "depends_on"
+
+# ============================================================
+# Don't hand a stranded VIP back to a node that cannot hold it
+# ------------------------------------------------------------
+# Claiming a stranded VIP is only half of it: the standby then yields again,
+# because the peer still answers DNS, and the address flaps — a reporter
+# measured it answering for 17s and silent for 12s, repeatedly (Discourse
+# 86667). So once we have picked up a stranded VIP, we keep it until the node
+# we are meant to defer to shows its HA daemon is actually running. Safe in the
+# conservative direction: we are the only holder, so refusing to let go cannot
+# produce two.
+_alive_probe() {   # $1 = curl exit, $2 = body
+    P_RC="$1" P_BODY="$2" bash -c '
+        CHECK_INTERVAL=10; HEALTH_TIMEOUT=1
+        source "'"$SCRIPT_DIR"'/../pihole-ha-platform"
+        curl() { printf "%s" "$P_BODY"; return "$P_RC"; }
+        '"$(extract_fn "$SCRIPT_DIR/../pihole-ha" peer_ha_alive)"'
+        peer_ha_alive 10.0.0.2 && echo ALIVE || echo DEAD
+    '
+}
+_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+_old="$(date -u -d "-10 min" +%Y-%m-%dT%H:%M:%SZ)"
+assert_eq "a freshly written status means the daemon is running" "ALIVE" \
+    "$(_alive_probe 0 "{\"timestamp\":\"$_now\"}")"
+# The dash keeps answering after the daemon stops; the status file goes stale.
+assert_eq "a stale status means it is not"                       "DEAD" \
+    "$(_alive_probe 0 "{\"timestamp\":\"$_old\"}")"
+assert_eq "no answer at all means it is not"                     "DEAD" "$(_alive_probe 7 '')"
+assert_eq "an answer without a timestamp means it is not"        "DEAD" "$(_alive_probe 0 '{"node":{}}')"
+
+_hold_probe() {   # $1 = claimed-stranded?, $2 = heir's daemon alive?
+    P_CLAIMED="$1" P_ALIVE="$2" P_ANSWERS="${3:-yes}" bash -c '
+        VIP=10.0.0.9; IFACE=eth0; VIP_ENABLED=true; HA_ENABLED=true
+        GATEWAY=10.0.0.1; MY_IDX=1; NODES=(10.0.0.1 10.0.0.2); LOCAL_IP=10.0.0.2
+        ROLE=SECONDARY; DEACTIVATE_AFTER=3; ACTIVATE_AFTER=2
+        activate_count=0; deactivate_count=0; vip_orphan_count=0
+        vip_claimed_stranded="$P_CLAIMED"
+        log_info() { :; }; log_warn() { :; }; notify() { :; }
+        ping() { return 0; }
+        is_dns_healthy() { return 0; }
+        should_i_hold_vip() { return 1; }     # a higher-priority node answers DNS
+        has_vip() { return 0; }               # and we are holding the address
+        peer_ha_alive() { [[ "$P_ALIVE" == yes ]]; }
+        peer_answers_dns() { [[ "${P_ANSWERS:-yes}" == yes ]]; }
+        remove_vip() { echo RELEASED; }
+        add_vip() { :; }; vip_is_answered() { return 0; }
+        write_status() { echo "STATUS: $1"; }
+        '"$(extract_fn "$SCRIPT_DIR/../pihole-ha" dns_only_vip_cycle)"'
+        dns_only_vip_cycle
+    '
+}
+assert_contains "a stranded VIP is kept while the heir's daemon is down" \
+    "$(_hold_probe true no)" "its HA daemon is not running"
+assert_not_contains "and is not released"          "$(_hold_probe true no)"  "RELEASED"
+# Once it can take it, the normal countdown resumes.
+assert_not_contains "a living heir gets the normal release countdown" \
+    "$(_hold_probe true yes)" "its HA daemon is not running"
+# A VIP held normally is unaffected by any of this.
+assert_not_contains "a normally-held VIP is unaffected" \
+    "$(_hold_probe false no)" "its HA daemon is not running"
+# Its daemon being back is not the same as it being able to serve: port 53
+# opens before FTL has loaded gravity, and releasing then leaves the VIP dark.
+assert_contains "a heir still starting up keeps the VIP here" \
+    "$(_hold_probe true yes no)" "not answering queries yet"
+assert_not_contains "and it is not released"  "$(_hold_probe true yes no)" "RELEASED"
+assert_not_contains "a heir that answers gets the normal countdown" \
+    "$(_hold_probe true yes yes)" "not answering queries yet"
+
+# ============================================================
+# A VIP nobody is holding must be picked up
+# ------------------------------------------------------------
+# A standby yields to any higher-priority node that answers ping and DNS. When
+# that node's Pi-hole is up but its HA daemon is not — a container that failed
+# to restart — the standby releases the VIP and the peer never claims it:
+# minutes of clients broadcasting "who-has <VIP>" into silence (Discourse
+# 86667 #167). Gating the yield on the peer's HA API would instead leave both
+# nodes holding the address when that API is simply unreachable, so the
+# standby asks the question that cannot be wrong: does anything answer for it.
+_answered_probe() {   # $1 = what arping prints
+    P_OUT="$1" bash -c '
+        VIP=10.0.0.9; IFACE=eth0
+        arping() { printf "%s\n" "$P_OUT"; return 1; }
+        command() { [[ "$1" == "-v" && "$2" == "arping" ]] && return 0; builtin command "$@"; }
+        '"$(extract_fn "$SCRIPT_DIR/../pihole-ha" vip_is_answered)"'
+        vip_is_answered && echo OWNED || echo UNOWNED
+    '
+}
+assert_eq "a reply means someone holds it" "OWNED" \
+    "$(_answered_probe '2 packets transmitted, 1 packets received,  50% unanswered')"
+assert_eq "no reply from a probe that ran means nobody does" "UNOWNED" \
+    "$(_answered_probe '2 packets transmitted, 0 packets received, 100% unanswered')"
+assert_eq "iputils wording is understood too" "UNOWNED" \
+    "$(_answered_probe 'Sent 2 probes (2 broadcast(s)) Received 0 response(s)')"
+assert_eq "and its positive case" "OWNED" \
+    "$(_answered_probe 'Sent 2 probes (2 broadcast(s)) Received 2 response(s)')"
+# The dangerous direction: a probe that could not run must never read as
+# "nobody owns it", or a standby claims an address another node is holding.
+# Caught in testing — as an unprivileged user every probe came back silent,
+# including the gateway's.
+assert_eq "a probe that could not run reads as owned" "OWNED" \
+    "$(_answered_probe 'arping: Could not open raw socket: Operation not permitted')"
+assert_eq "an unknown interface reads as owned" "OWNED" \
+    "$(_answered_probe 'arping: Unknown interface eth9')"
+assert_eq "no arping at all reads as owned" "OWNED" \
+    "$(bash -c '
+        VIP=10.0.0.9; IFACE=eth0
+        command() { if [[ "$1" == "-v" && "$2" == "arping" ]]; then return 1; fi; builtin command "$@"; }
+        '"$(extract_fn "$SCRIPT_DIR/../pihole-ha" vip_is_answered)"'
+        vip_is_answered && echo OWNED || echo UNOWNED')"
+assert_contains "claiming a stranded VIP needs several silent checks" \
+    "$(cat "$SCRIPT_DIR/../pihole-ha")" "VIP_ORPHAN_AFTER"
+assert_contains "and says why it claimed" \
+    "$(cat "$SCRIPT_DIR/../pihole-ha")" "event=vip_orphaned"
+assert_contains "a node whose own DNS is down never claims" \
+    "$(extract_fn "$SCRIPT_DIR/../pihole-ha" dns_only_vip_cycle)" 'is_dns_healthy "$LOCAL_IP" &&'
+
+# ============================================================
+# A VIP another daemon put there is not ours to claim or to fail to remove
+# ------------------------------------------------------------
+# has_vip matches the address with ANY prefix, but remove_vip deleted /32. On a
+# node where keepalived had added the same address as /24, the node therefore
+# believed it held the VIP and could not release it:
+#   vip_remove status=failed error="RTNETLINK answers: Address not available"
+# It then kept reporting a VIP that another daemon owned, while nothing on the
+# LAN answered for it (Discourse 86667 #161).
+_vip_prefix_probe() {   # $1 = the `ip addr show` line to present
+    P_LINE="$1" bash -c '
+        VIP=192.168.1.100; IFACE=eth0
+        ip() { printf "%s\n" "$P_LINE"; }
+        '"$(extract_fn "$SCRIPT_DIR/../pihole-ha" vip_prefix)"'
+        vip_prefix
+    '
+}
+assert_eq "our own /32 is read back"        "32" "$(_vip_prefix_probe '    inet 192.168.1.100/32 scope global eth0')"
+assert_eq "a foreign /24 is read back"      "24" "$(_vip_prefix_probe '    inet 192.168.1.100/24 brd 192.168.1.255 scope global eth0')"
+assert_eq "an absent address yields nothing" ""  "$(_vip_prefix_probe '    inet 192.168.1.7/24 scope global eth0')"
+_remove_probe() {   # $1 = prefix present on the interface
+    # remove_vip captures the command's output into $err, so the stub records
+    # the invocation to a file instead of stdout.
+    local log; log="$(mktemp)"
+    P_LOG="$log" P_PLEN="$1" bash -c '
+        VIP=192.168.1.100; IFACE=eth0
+        log_info() { echo "INFO $*"; }; log_error() { echo "ERROR $*"; }
+        platform_ftl_restart_dns() { :; }
+        has_vip() { return 0; }
+        vip_prefix() { printf "%s" "$P_PLEN"; }
+        ip() { echo "CMD: $*" >> "$P_LOG"; }
+        '"$(extract_fn "$SCRIPT_DIR/../pihole-ha" remove_vip)"'
+        remove_vip
+    '
+    cat "$log"; rm -f "$log"
+}
+assert_contains "removal uses the prefix that is actually there" \
+    "$(_remove_probe 24)" "addr del 192.168.1.100/24"
+assert_contains "and still handles our own /32" \
+    "$(_remove_probe 32)" "addr del 192.168.1.100/32"
+# Claiming an address another daemon owns must be said out loud, not absorbed.
+_claim_probe() {   # $1 = prefix already present
+    P_PLEN="$1" bash -c '
+        VIP=192.168.1.100; IFACE=eth0; VIP_ENABLED=true
+        log_info() { echo "INFO $*"; }; log_warn() { echo "WARN $*"; }; log_error() { :; }
+        notify() { :; }; announce_vip() { :; }
+        ensure_iface() { return 0; }
+        has_vip() { return 0; }
+        vip_prefix() { printf "%s" "$P_PLEN"; }
+        '"$(extract_fn "$SCRIPT_DIR/../pihole-ha" add_vip)"'
+        add_vip
+    '
+}
+assert_contains "a VIP with a foreign prefix is flagged" "$(_claim_probe 24)" "event=vip_foreign"
+assert_contains "and names the likely owner"             "$(_claim_probe 24)" "keepalived"
+assert_not_contains "our own /32 is not flagged"         "$(_claim_probe 32)" "event=vip_foreign"
+
+# "Unknown IP: x.x.x.x" told nobody what it had been compared against.
+_hasrc3="$(cat "$SCRIPT_DIR/../pihole-ha")"
+assert_contains "the identity error prints the node list"  "$_hasrc3" 'not in the cluster node list (HA_NODES='
+assert_contains "and names the Docker override"            "$_hasrc3" "PIHOLE_HA_LOCAL_IP"
+assert_contains "and explains why a changed list was ignored" "$_hasrc3" "PIHOLE_HA_FORCE_CONFIG=true"
+
+# ============================================================
+# Holding the VIP must be re-announced, not announced once
+# ------------------------------------------------------------
+# A takeover announces once. A reporter captured clients broadcasting
+# "who-has <VIP>" for six minutes with nothing answering, then everything
+# recovering the instant another takeover sent a fresh burst — a lost or
+# ignored announcement is invisible until ARP entries age out (Discourse
+# 86667 #156). keepalived re-announces for the same reason.
+_reann_probe() {   # $1 = holds the VIP?, $2 = seconds from now until next due
+    # The real call redirects to /dev/null, so the stub records to a file; and
+    # EPOCHSECONDS cannot be faked, so timings are measured against it.
+    local log; log="$(mktemp)"
+    P_HAS="$1" P_IN="$2" P_LOG="$log" bash -c '
+        VIP_ENABLED=true; VIP_ANNOUNCE_EVERY=60
+        VIP_ANNOUNCE_NEXT=$(( EPOCHSECONDS + P_IN ))
+        has_vip() { [[ "$P_HAS" == yes ]]; }
+        announce_vip() { echo ANNOUNCED >> "$P_LOG"; }
+        '"$(extract_fn "$SCRIPT_DIR/../pihole-ha" reannounce_vip)"'
+        reannounce_vip; wait 2>/dev/null
+        echo "due_in=$(( VIP_ANNOUNCE_NEXT - EPOCHSECONDS )) next_raw=$VIP_ANNOUNCE_NEXT"
+    '
+    cat "$log" 2>/dev/null; rm -f "$log"
+}
+assert_contains "the holder re-announces when due"        "$(_reann_probe yes 0)"  "ANNOUNCED"
+assert_contains "and schedules the next one a minute out" "$(_reann_probe yes 0)"  "due_in=60"
+assert_not_contains "it does not announce before due"     "$(_reann_probe yes 30)" "ANNOUNCED"
+assert_contains "and leaves that schedule alone"          "$(_reann_probe yes 30)" "due_in=30"
+assert_not_contains "a node without the VIP says nothing" "$(_reann_probe no 0)"   "ANNOUNCED"
+# Losing the VIP must re-arm, or the node that takes it back waits out the timer.
+# Re-armed means "due immediately", i.e. the timer is reset to zero rather than
+# left in the future — otherwise retaking the VIP waits out the old schedule.
+assert_contains "losing the VIP re-arms the next claim"   "$(_reann_probe no 999)" "next_raw=0"
+assert_contains "the loop re-announces every cycle"     "$(cat "$SCRIPT_DIR/../pihole-ha")" "reannounce_vip            #"
+
+# ============================================================
 # A node must be able to be told its own address
 # ------------------------------------------------------------
 # Identity is detected from the addresses this process can see. That is the
@@ -1118,7 +1502,7 @@ assert_contains "a missing arping is called out" \
     "$(bash -c '
         VIP=10.0.0.9; IFACE=eth0
         log_warn() { echo "WARN $*"; }; log_info() { echo "INFO $*"; }
-        command() { [[ "$1" == "-v" && "$2" == "arping" ]] && return 1; builtin command "$@"; }
+        command() { if [[ "$1" == "-v" && "$2" == "arping" ]]; then return 1; fi; builtin command "$@"; }
         '"$(extract_fn "$SCRIPT_DIR/../pihole-ha" announce_vip)"'
         announce_vip')" "arping is not installed"
 assert_contains "taking the VIP triggers the announcement" \

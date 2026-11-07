@@ -46,6 +46,7 @@ class DockerDhcpTests(unittest.TestCase):
             with tempfile.TemporaryDirectory(prefix='ha-dhcp-test-') as temp:
                 trace = Path(temp) / 'cli'
                 script = 'set -uo pipefail\npihole-FTL() { printf "%s\\n" "$*" >> "$TRACE"; }\n'
+                script += function(ROOT / 'pihole-ha-platform', 'sane_port') + '\n'
                 script += function(ROOT / 'pihole-ha-platform', 'platform_set_dhcp')
                 script += '\nplatform_set_dhcp "$ACTIVE"\n'
                 env = dict(os.environ, PIHOLE_HA_PLATFORM=platform,
